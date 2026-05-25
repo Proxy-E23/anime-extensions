@@ -14,7 +14,6 @@ import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.animesource.online.ParsedAnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.awaitSuccess
-import eu.kanade.tachiyomi.torrentutils.TorrentUtils
 import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.utils.getPreferencesLazy
 import okhttp3.Headers
@@ -22,7 +21,6 @@ import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
-import java.net.SocketTimeoutException
 import java.net.URLEncoder
 import java.text.SimpleDateFormat
 import java.util.Locale
@@ -161,13 +159,16 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
         if (url.contains("grouped=1")) {
             return episodeListGroupedParse(url)
         }
-        return episodeListSingleParse(response)
+        return episodeListSingleParseHtml(response)
     }
 
+    // ------------------------------------------------------------------
+    // Grouped: recorre cada página de resultados y por cada torrent
+    // extrae el episodio con puro HTML. TorrentUtils NO se llama aquí.
+    // ------------------------------------------------------------------
     private fun episodeListGroupedParse(groupedUrl: String): List<SEpisode> {
-        val rawQuery = groupedUrl.substringAfter("&q=").substringBefore("&")
+        val encodedQuery = groupedUrl.substringAfter("&q=").substringBefore("&")
         val categoryParam = groupedUrl.substringAfter("&c=").substringBefore("&")
-        val encodedQuery = rawQuery
 
         val torrentDetailUrls = mutableListOf<String>()
         var page = 1
@@ -188,13 +189,13 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
         for (detailUrl in torrentDetailUrls) {
             try {
                 val detailResponse = client.newCall(GET(detailUrl)).execute()
-                val episodes = episodeListSingleParse(detailResponse)
-                allEpisodes.addAll(episodes)
+                allEpisodes.addAll(episodeListSingleParseHtml(detailResponse))
             } catch (e: Exception) {
-                // Skip dead/broken torrents
+                // página inaccesible, se omite
             }
         }
 
+        // Numerar en orden descendente (más reciente = número mayor)
         var episodeNumber = allEpisodes.size.toFloat()
         allEpisodes.forEach { ep ->
             ep.episode_number = episodeNumber
@@ -206,39 +207,34 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
         return allEpisodes
     }
 
-    private fun episodeListSingleParse(response: Response): List<SEpisode> {
+    // ------------------------------------------------------------------
+    // Single torrent: construye el SEpisode SOLO con HTML.
+    // El magnet completo (con trackers) está en la propia página de Nyaa,
+    // así que no se necesita parsear el .torrent para reproducir.
+    // TorrentUtils se llama en getVideoList(), justo antes de reproducir.
+    // ------------------------------------------------------------------
+    private fun episodeListSingleParseHtml(response: Response): List<SEpisode> {
         val document = response.asJsoup()
-        val torrentFile = "$baseUrl${document.selectFirst("div.panel-footer a")?.attr("href").orEmpty()}"
-        val torrentDate = parseDate(document.select("div.panel-body > div:nth-child(1) > div:nth-child(4)").text())
-        return try {
-            val torrent = TorrentUtils.getTorrentInfo(torrentFile, "torrent")
-            val torrentIndexed = torrent.files
-            val torrentTracker = torrent.trackers.filter { it.trim().isNotEmpty() }.joinToString("") { "&tr=$it" }
-            val torrentMagnet = "magnet:?xt=urn:btih:${torrent.hash}&dn=${torrent.hash}"
+        val magnet = document.selectFirst("a[href^='magnet:']")?.attr("href").orEmpty()
+        if (magnet.isEmpty()) return emptyList()
 
-            var episodeNumber = 1F
-            torrentIndexed
-                .filter { it.path.substringAfterLast('.').lowercase(Locale.ROOT) in validExtensions }
-                .map {
-                    SEpisode.create().apply {
-                        name = if (preferences.getBoolean(IS_FILENAME_KEY, IS_FILENAME_DEFAULT)) {
-                            it.path.trim().split('/').last()
-                        } else {
-                            "Episodio ${episodeNumber.toInt()}"
-                        }
-                        url = "$torrentMagnet$torrentTracker&index=${it.indexFile}"
-                        episode_number = episodeNumber++
-                        scanlator = convertBytesToReadable(it.size)
-                        date_upload = torrentDate
-                    }
-                }.reversed()
-                .toMutableList()
-        } catch (e: SocketTimeoutException) {
-            throw Exception("Dead Torrent \uD83D\uDE35")
-        }
+        val title = document.select("h3.panel-title").text()
+            .ifEmpty { response.request.url.pathSegments.lastOrNull().orEmpty() }
+        val torrentDate = parseDate(
+            document.select("div.panel-body > div:nth-child(1) > div:nth-child(4)").text(),
+        )
+        val filesize = document.select("div.panel-body > div:nth-child(4) > div:nth-child(2)").text()
+
+        return listOf(
+            SEpisode.create().apply {
+                name = if (preferences.getBoolean(IS_FILENAME_KEY, IS_FILENAME_DEFAULT)) title else "Episodio 1"
+                url = magnet
+                episode_number = 1F
+                scanlator = filesize
+                date_upload = torrentDate
+            },
+        )
     }
-
-    private val validExtensions = setOf("mp4", "mov", "avi", "wmv", "mkv", "flv", "webm", "ogg", "mpeg", "mpg", "mts", "vob", "ts")
 
     private fun parseDate(dateStr: String): Long = runCatching { DATE_FORMATTER.parse(dateStr)?.time }
         .getOrNull() ?: 0L
@@ -257,7 +253,14 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
     override fun episodeFromElement(element: Element) = throw Exception("Not used")
 
     // ============================ Video Links =============================
-    override suspend fun getVideoList(episode: SEpisode): List<Video> = listOf(Video(episode.url, episode.name, episode.url))
+    // Aquí sí se llama TorrentUtils, solo cuando el usuario va a reproducir.
+    // En ese momento Anikku ya tiene el servicio torrent disponible.
+    override suspend fun getVideoList(episode: SEpisode): List<Video> {
+        val magnetUrl = episode.url
+        // Si el magnet ya trae &index= es porque viene de un torrent con
+        // múltiples archivos (flujo legacy); se pasa directo.
+        return listOf(Video(magnetUrl, episode.name, magnetUrl))
+    }
 
     override fun videoListSelector() = throw Exception("Not used")
     override fun videoFromElement(element: Element) = throw Exception("Not used")
@@ -352,4 +355,3 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
         }
     }
 }
-// trigger build
