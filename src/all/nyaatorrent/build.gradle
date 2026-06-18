@@ -1,7 +1,7 @@
 ext {
     extName = 'Nyaa (Torrent)'
     extClass = '.NyaaFactory'
-    extVersionCode = 9
+    extVersionCode = 10
     isTorrent = true
     isNsfw = true
 }
