@@ -2,6 +2,7 @@ package eu.kanade.tachiyomi.animeextension.all.nyaatorrent
 
 import android.widget.Toast
 import androidx.preference.EditTextPreference
+import androidx.preference.MultiSelectListPreference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
@@ -57,6 +58,44 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
         return anime
     }
 
+    // ======================== Resolution filtering =========================
+    // Detecta menciones de resolución en un título o nombre de archivo.
+    // Devuelve el set de resoluciones detectadas usando las claves internas
+    // ("4k", "1080p", "720p", "480p") sin importar la variante textual usada
+    // (ej. "2160p" y "4K" mapean ambos a "4k").
+    private val resolutionRegexes: List<Pair<Regex, String>> = listOf(
+        Regex("""(?i)\b(2160p|4k|uhd)\b""") to "4k",
+        Regex("""(?i)\b1080p\b""") to "1080p",
+        Regex("""(?i)\b720p\b""") to "720p",
+        Regex("""(?i)\b480p\b""") to "480p",
+    )
+
+    private fun detectResolutions(text: String): Set<String> = resolutionRegexes.mapNotNullTo(mutableSetOf()) { (regex, key) ->
+        key.takeIf { regex.containsMatchIn(text) }
+    }
+
+    private fun ignoredResolutions(): Set<String> = preferences.getStringSet(PREF_IGNORED_RES_KEY, emptySet()) ?: emptySet()
+
+    // Un torrent se oculta por completo solo si TODAS las resoluciones que
+    // menciona su título están ignoradas. Si el título es mixto (ej. batch
+    // "1080p+720p") y solo una de las dos está ignorada, el torrent se
+    // conserva: el filtrado fino de esa resolución concreta ocurre luego a
+    // nivel de archivo/episodio dentro del torrent.
+    private fun isAnimeFullyIgnored(title: String): Boolean {
+        val ignored = ignoredResolutions()
+        if (ignored.isEmpty()) return false
+        val detected = detectResolutions(title)
+        if (detected.isEmpty()) return false
+        return detected.all { it in ignored }
+    }
+
+    // Nota: se probó también un filtro a nivel de archivo/episodio individual
+    // (útil para batches mixtos con varias resoluciones), pero el SDK
+    // (SAnime) no expone si el anime ya está en la biblioteca, así que no es
+    // posible aplicar ese filtro solo a descubrimiento sin arriesgar afectar
+    // también las actualizaciones de anime ya guardado. Por eso el filtrado
+    // se queda únicamente a nivel de torrent (ver isAnimeFullyIgnored).
+
     // ============================== Popular ===============================
     override fun popularAnimeRequest(page: Int): Request {
         val categoryParam = if (extId == 1) "1_0" else "1_1"
@@ -67,6 +106,12 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
     override fun popularAnimeFromElement(element: Element): SAnime = animeFromElement(element)
     override fun popularAnimeNextPageSelector(): String = animeNextPageSelector
 
+    override fun popularAnimeParse(response: Response): AnimesPage {
+        val page = super.popularAnimeParse(response)
+        val filtered = page.animes.filterNot { isAnimeFullyIgnored(it.title) }
+        return AnimesPage(filtered, page.hasNextPage)
+    }
+
     // =============================== Latest ===============================
     override fun latestUpdatesRequest(page: Int): Request {
         val categoryParam = if (extId == 1) "1_0" else "1_1"
@@ -76,6 +121,12 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
     override fun latestUpdatesSelector(): String = animeSelector
     override fun latestUpdatesFromElement(element: Element): SAnime = animeFromElement(element)
     override fun latestUpdatesNextPageSelector(): String = animeNextPageSelector
+
+    override fun latestUpdatesParse(response: Response): AnimesPage {
+        val page = super.latestUpdatesParse(response)
+        val filtered = page.animes.filterNot { isAnimeFullyIgnored(it.title) }
+        return AnimesPage(filtered, page.hasNextPage)
+    }
 
     // =============================== Search ===============================
     override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
@@ -223,6 +274,12 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
     override fun searchAnimeSelector() = animeSelector
     override fun searchAnimeFromElement(element: Element) = animeFromElement(element)
     override fun searchAnimeNextPageSelector() = animeNextPageSelector
+
+    override fun searchAnimeParse(response: Response): AnimesPage {
+        val page = super.searchAnimeParse(response)
+        val filtered = page.animes.filterNot { isAnimeFullyIgnored(it.title) }
+        return AnimesPage(filtered, page.hasNextPage)
+    }
 
     // =========================== Anime Details ============================
     override fun animeDetailsParse(document: Document): SAnime {
@@ -414,7 +471,10 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
             val searchDoc = client.newCall(GET(searchUrl)).execute().use { it.asJsoup() }
             searchDoc.select("$animeSelector td:nth-child(2) a:not(.comments)").forEach { a ->
                 val href = a.attr("href")
-                if (href.isNotEmpty()) torrentDetailUrls.add("$baseUrl$href")
+                val title = a.attr("title")
+                if (href.isNotEmpty() && !isAnimeFullyIgnored(title)) {
+                    torrentDetailUrls.add("$baseUrl$href")
+                }
             }
             hasNextPage = searchDoc.selectFirst(animeNextPageSelector) != null
             page++
@@ -465,8 +525,8 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
         val match = folderKeywordRegex.find(rawName) ?: return ""
         val keyword = match.groupValues[1].lowercase().let { kw ->
             when {
-                kw == "s" || kw == "season" -> "Season"
-                kw == "part" -> "Part"
+                kw == "s" || kw == "season" -> "Temporada"
+                kw == "part" -> "Parte"
                 kw == "cour" -> "Cour"
                 kw == "temporada" -> "Temporada"
                 else -> kw.replaceFirstChar { it.uppercase() }
@@ -863,17 +923,17 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         EditTextPreference(screen.context).apply {
             key = PREF_DOMAIN_KEY
-            title = "Custom Domain Link"
-            dialogTitle = "Custom Domain Link"
-            dialogMessage = "eg. https://nyaa.si/"
+            title = "Enlace de dominio personalizado"
+            dialogTitle = "Enlace de dominio personalizado"
+            dialogMessage = "ej. https://nyaa.si/"
             setOnPreferenceChangeListener { _, newValue ->
                 val trimmedValue = (newValue as String).trim()
                 if (trimmedValue.isBlank()) {
                     preferences.edit().putString(key, extURL).apply()
-                    Toast.makeText(screen.context, "Default URL restored. Restart App to apply new setting.", Toast.LENGTH_LONG).show()
+                    Toast.makeText(screen.context, "URL predeterminada restaurada. Reinicia la app para aplicar el nuevo ajuste.", Toast.LENGTH_LONG).show()
                 } else {
                     preferences.edit().putString(key, trimmedValue).apply()
-                    Toast.makeText(screen.context, "Restart App to apply new setting.", Toast.LENGTH_LONG).show()
+                    Toast.makeText(screen.context, "Reinicia la app para aplicar el nuevo ajuste.", Toast.LENGTH_LONG).show()
                 }
                 true
             }
@@ -881,45 +941,58 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
 
         SwitchPreferenceCompat(screen.context).apply {
             key = IS_FILENAME_KEY
-            title = "Only display filename"
+            title = "Solo mostrar nombre del archivo"
             setDefaultValue(IS_FILENAME_DEFAULT)
             setOnPreferenceChangeListener { _, newValue ->
                 preferences.edit().putBoolean(key, newValue as Boolean).commit()
             }
-            summary = "Will not display full path of episode."
+            summary = "No mostrará la ruta completa del episodio."
+        }.also(screen::addPreference)
+
+        MultiSelectListPreference(screen.context).apply {
+            key = PREF_IGNORED_RES_KEY
+            title = "Ignorar resoluciones"
+            summary = "Oculta resultados nuevos que coincidan con las resoluciones seleccionadas."
+            entries = RESOLUTION_ENTRIES
+            entryValues = RESOLUTION_VALUES
+            setDefaultValue(emptySet<String>())
+            setOnPreferenceChangeListener { _, newValue ->
+                @Suppress("UNCHECKED_CAST")
+                preferences.edit().putStringSet(key, newValue as Set<String>).commit()
+            }
         }.also(screen::addPreference)
     }
 
     // ============================== Filters ==============================
     private data class Sort(val name: String, val id: String)
-    private class SortList(availableSorts: Array<String>) : AnimeFilter.Sort("Sort", availableSorts, Selection(0, false))
+    private class SortList(availableSorts: Array<String>) : AnimeFilter.Sort("Ordenar", availableSorts, Selection(0, false))
     private val availableSorts = arrayOf(
-        Sort("Date", "id"),
+        Sort("Fecha", "id"),
         Sort("Seeders", "seeders"),
         Sort("Leechers", "leechers"),
-        Sort("Downloads", "downloads"),
+        Sort("Descargas", "downloads"),
     )
 
     private data class Filter(val name: String, val id: String) {
         override fun toString() = name
     }
-    private class FilterList(availableFilters: Array<String>) : AnimeFilter.Select<String>("Filter", availableFilters)
+    private class FilterList(availableFilters: Array<String>) : AnimeFilter.Select<String>("Filtro", availableFilters)
     private val availableFilters = arrayOf(
-        Filter("No filter", "0"),
-        Filter("No remakes", "1"),
-        Filter("Trusted only", "2"),
+        Filter("Sin filtro", "0"),
+        Filter("Sin remakes", "1"),
+        Filter("Solo confiables", "2"),
     )
 
     private data class Category(val name: String, val id: String) {
         override fun toString() = name
     }
-    private class CategoriesList(availableCategories: Array<String>) : AnimeFilter.Select<String>("Category", availableCategories)
+    private class CategoriesList(availableCategories: Array<String>) : AnimeFilter.Select<String>("Categoría", availableCategories)
     private val availableCategories = if (extId == 1) {
         listOf(
-            Category("All", "1_0"),
-            Category("Anime Music Video", "1_1"),
-            Category("English-translated", "1_2"),
-            Category("Non-English-translated", "1_3"),
+            Category("Todas", "1_0"),
+            Category("Video musical de anime", "1_1"),
+            Category("Traducido al inglés", "1_2"),
+            Category("No traducido al inglés", "1_3"),
             Category("Raw", "1_4"),
         )
     } else {
@@ -946,6 +1019,10 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
         private const val PREF_DOMAIN_KEY = "domain"
         private const val IS_FILENAME_KEY = "filename"
         private const val IS_FILENAME_DEFAULT = false
+        private const val PREF_IGNORED_RES_KEY = "ignored_resolutions"
+
+        private val RESOLUTION_ENTRIES = arrayOf("4K", "1080p", "720p", "480p")
+        private val RESOLUTION_VALUES = arrayOf("4k", "1080p", "720p", "480p")
 
         private val DATE_FORMATTER by lazy {
             SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.ENGLISH)
