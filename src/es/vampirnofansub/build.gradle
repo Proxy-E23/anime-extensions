@@ -1,0 +1,7 @@
+ext {
+    extName = 'Vampir no Fansub'
+    extClass = '.VampirNoFansub'
+    extVersionCode = 1
+}
+
+apply plugin: "kei.plugins.extension.legacy"
