@@ -1,19 +1,19 @@
 package eu.kanade.tachiyomi.animeextension.es.beatzanime
 
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
+import eu.kanade.tachiyomi.animesource.model.AnimesPage
 import eu.kanade.tachiyomi.animesource.model.SAnime
 import eu.kanade.tachiyomi.animesource.model.SEpisode
 import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.animesource.online.ParsedAnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
-import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.utils.parseAs
 import kotlinx.serialization.Serializable
-import kotlinx.serialization.json.JsonObject
-import okhttp3.FormBody
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
@@ -24,7 +24,7 @@ class BeatZAnime : ParsedAnimeHttpSource() {
 
     override val baseUrl = "https://www.beatz-anime.net"
 
-    private val indexHost = "dd.beatz-anime.net"
+    private val indexHost = "bz.beatz-anime.net"
     private val indexHttpUrl = "https://$indexHost".toHttpUrl()
 
     override val lang = "es"
@@ -32,28 +32,22 @@ class BeatZAnime : ParsedAnimeHttpSource() {
     override val supportsLatest = true
 
     // ============================== Popular ===============================
+    // El catálogo completo (orden alfabético) vive en /lista-animes/ y se
+    // renderiza entero en una sola página (sin paginación de servidor).
 
-    override fun popularAnimeRequest(page: Int): Request {
-        val url = if (page > 1) {
-            "$baseUrl/emision/pagina=$page"
-        } else {
-            "$baseUrl/emision/"
-        }
+    override fun popularAnimeRequest(page: Int): Request = GET("$baseUrl/lista-animes/", headers)
 
-        return GET(url, headers)
-    }
-
-    override fun popularAnimeSelector(): String = ".row > div:has(a.titulo-largo)"
+    override fun popularAnimeSelector(): String = "div.anime-card"
 
     override fun popularAnimeFromElement(element: Element): SAnime = SAnime.create().apply {
-        thumbnail_url = element.selectFirst("img")!!.imgAttr()
-        with(element.selectFirst("a.titulo-largo")!!) {
+        thumbnail_url = element.selectFirst("img.anime-poster")?.imgAttr()
+        with(element.selectFirst("a.anime-poster-link")!!) {
             setUrlWithoutDomain(attr("abs:href"))
-            title = text()
         }
+        title = element.selectFirst("span.overlay-title-link")?.text().orEmpty()
     }
 
-    override fun popularAnimeNextPageSelector(): String = "ul.pagination > li.active + li:not(.disabled)"
+    override fun popularAnimeNextPageSelector(): String? = null
 
     // =============================== Latest ===============================
 
@@ -66,49 +60,75 @@ class BeatZAnime : ParsedAnimeHttpSource() {
 
         return GET(url, headers)
     }
-    override fun latestUpdatesSelector(): String = popularAnimeSelector()
+    override fun latestUpdatesSelector(): String = ".row > div:has(a.titulo-largo)"
 
-    override fun latestUpdatesFromElement(element: Element): SAnime = popularAnimeFromElement(element)
-
-    override fun latestUpdatesNextPageSelector(): String = popularAnimeNextPageSelector()
-
-    // =============================== Search ===============================
-
-    override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
-        val source = filters.filterIsInstance<SourceFilter>().first().getValue()
-        val status = filters.filterIsInstance<StatusFilter>().first().getValue()
-        val type = filters.filterIsInstance<TypeFilter>().first().getValue()
-
-        val url = "$baseUrl/lista-animes/index.php"
-
-        val formBody = FormBody.Builder().apply {
-            add("buscar", query)
-            add("fuente", source)
-            add("estado", status)
-            add("tipo-anime", type)
-        }.build()
-
-        val formHeaders = headersBuilder().apply {
-            add("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
-            add("Host", baseUrl.toHttpUrl().host)
-            add("Origin", baseUrl)
-            add("Referer", url)
-        }.build()
-
-        return POST(url, formHeaders, formBody)
-    }
-
-    override fun searchAnimeSelector(): String = ".row > div:has(span.titulo)"
-
-    override fun searchAnimeFromElement(element: Element): SAnime = SAnime.create().apply {
-        thumbnail_url = element.selectFirst("img")!!.imgAttr()
-        with(element.selectFirst("a:has(span)")!!) {
+    override fun latestUpdatesFromElement(element: Element): SAnime = SAnime.create().apply {
+        thumbnail_url = element.selectFirst("img")?.imgAttr()
+        with(element.selectFirst("a.titulo-largo")!!) {
             setUrlWithoutDomain(attr("abs:href"))
             title = text()
         }
     }
 
+    override fun latestUpdatesNextPageSelector(): String = "ul.pagination > li.active + li:not(.disabled)"
+
+    // =============================== Search ===============================
+    // IMPORTANTE: /lista-animes/ no filtra en el servidor. Devuelve SIEMPRE
+    // el catálogo completo como HTML estático (cada .anime-card trae los
+    // atributos data-name/data-fuente/data-estado/data-tipo) y un script en
+    // el propio navegador oculta las tarjetas que no matchean. Como la
+    // extensión no ejecuta JS, hay que replicar ese filtrado aquí, en Kotlin,
+    // sobre el HTML completo.
+
+    // La request siempre trae el catálogo completo; query y filtros no se
+    // envían al servidor porque este no los soporta.
+    override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request = GET("$baseUrl/lista-animes/", headers)
+
+    override fun searchAnimeSelector(): String = popularAnimeSelector()
+
+    override fun searchAnimeFromElement(element: Element): SAnime = popularAnimeFromElement(element)
+
     override fun searchAnimeNextPageSelector(): String? = null
+
+    // Se sobrescribe el punto de entrada de más alto nivel para tener acceso
+    // simultáneo a `query` y `filters` (searchAnimeParse solo recibe la
+    // Response). Aquí se aplica el mismo filtrado que el JS del sitio hace
+    // en el navegador, ya que el servidor siempre devuelve todo sin filtrar.
+    override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
+        val request = searchAnimeRequest(page, query, filters)
+        val document = client.newCall(request).execute().asJsoup()
+
+        val source = filters.filterIsInstance<SourceFilter>().firstOrNull()?.getValue().orEmpty()
+        val status = filters.filterIsInstance<StatusFilter>().firstOrNull()?.getValue().orEmpty()
+        val type = filters.filterIsInstance<TypeFilter>().firstOrNull()?.getValue().orEmpty()
+
+        val normQuery = query.normalizeForCompare()
+        val normSource = source.normalizeForCompare()
+        val normStatus = status.normalizeForCompare()
+        val normType = type.normalizeForCompare()
+
+        val animes = document.select(searchAnimeSelector()).filter { element ->
+            val name = element.attr("data-name").normalizeForCompare()
+            val fuente = element.attr("data-fuente").normalizeForCompare()
+            val estado = element.attr("data-estado").normalizeForCompare()
+            val tipo = element.attr("data-tipo").normalizeForCompare()
+
+            val matchQuery = normQuery.isEmpty() || name.contains(normQuery)
+            val matchSource = normSource.isEmpty() || fuente.contains(normSource)
+            val matchStatus = normStatus.isEmpty() || estado == normStatus
+            val matchType = normType.isEmpty() || tipo == normType
+
+            matchQuery && matchSource && matchStatus && matchType
+        }.map { searchAnimeFromElement(it) }
+
+        return AnimesPage(animes, false)
+    }
+
+    private fun String.normalizeForCompare(): String = this
+        .lowercase()
+        .let { java.text.Normalizer.normalize(it, java.text.Normalizer.Form.NFD) }
+        .replace(Regex("\\p{Mn}+"), "")
+        .trim()
 
     // ============================== Filters ===============================
 
@@ -153,16 +173,17 @@ class BeatZAnime : ParsedAnimeHttpSource() {
         val document = response.asJsoup()
         val episodeList = mutableListOf<SEpisode>()
 
-        val indexUrlRaw = document.selectFirst("a[href*=$indexHost]")!!.attr("abs:href").toHttpUrl()
-        val indexUrl = if (indexUrlRaw.encodedPath.contains("api/raw/")) {
-            val path = indexUrlRaw.queryParameter("path")!!.substringAfter("/")
-                .substringBefore("/")
-            "https://$indexHost/$path/"
-        } else {
-            indexUrlRaw.toString()
-        }
+        val onclickAttr = document.select("button[onclick*=$indexHost]").firstOrNull { btn ->
+            val onclick = btn.attr("onclick")
+            onclick.contains(indexHost) && !onclick.contains("/d/")
+        }?.attr("onclick") ?: throw Exception("No se encontró el enlace a la carpeta de $indexHost")
 
-        fun traverseFolder(basePath: String, relativePath: String, recursionDepth: Int = 0) {
+        val folderUrl = Regex("""window\.open\('([^']+)'""").find(onclickAttr)?.groupValues?.get(1)
+            ?: throw Exception("No se pudo extraer la URL de la carpeta")
+
+        val basePath = "/" + folderUrl.toHttpUrl().pathSegments.joinToString("/")
+
+        fun traverseFolder(path: String, relativePath: String, recursionDepth: Int = 0) {
             if (recursionDepth == 2) return
 
             val apiHeaders = headersBuilder().apply {
@@ -171,7 +192,7 @@ class BeatZAnime : ParsedAnimeHttpSource() {
                 add(
                     "Referer",
                     indexHttpUrl.newBuilder()
-                        .addPathSegments(basePath)
+                        .addPathSegments(path.removePrefix("/"))
                         .build()
                         .toString(),
                 )
@@ -179,25 +200,32 @@ class BeatZAnime : ParsedAnimeHttpSource() {
 
             val apiUrl = indexHttpUrl.newBuilder().apply {
                 addPathSegment("api")
-                addPathSegment("")
-                addQueryParameter("path", basePath)
+                addPathSegment("fs")
+                addPathSegment("list")
             }.build()
 
-            val data = client.newCall(
-                GET(apiUrl, apiHeaders),
-            ).execute().parseAs<IndexResponseDto>()
+            val jsonBody = """{"path":"${path.replace("\"", "\\\"")}","password":"","page":1,"per_page":0,"refresh":false}"""
+                .toRequestBody("application/json".toMediaType())
 
-            data.folder.value.forEach { item ->
-                if (item.folder != null) {
-                    traverseFolder("$basePath/${item.name}", item.name, recursionDepth + 1)
-                } else if (item.file != null) {
+            val request = Request.Builder()
+                .url(apiUrl)
+                .headers(apiHeaders)
+                .post(jsonBody)
+                .build()
+
+            val data = client.newCall(request).execute().parseAs<IndexResponseDto>()
+
+            data.data.content.forEach { item ->
+                if (item.is_dir) {
+                    traverseFolder("$path/${item.name}", item.name, recursionDepth + 1)
+                } else {
                     val fileExt = item.name.substringAfterLast(".")
                     if (!SUPPORTED_FORMATS.any { it.equals(fileExt, true) }) return@forEach
 
                     episodeList.add(
                         SEpisode.create().apply {
                             name = item.name
-                            url = "$basePath/${item.name}"
+                            url = "$path/${item.name}"
                             scanlator = buildList {
                                 if (relativePath != "") add(relativePath)
                                 add(item.size.formatBytes())
@@ -208,25 +236,24 @@ class BeatZAnime : ParsedAnimeHttpSource() {
             }
         }
 
-        traverseFolder("/${indexUrl.toHttpUrl().pathSegments.first()}", "")
+        traverseFolder(basePath, "")
 
         return episodeList.reversed()
     }
 
     @Serializable
     class IndexResponseDto(
-        val folder: FolderDto,
+        val data: DataDto,
     ) {
         @Serializable
-        class FolderDto(
-            val value: List<ItemDto>,
+        class DataDto(
+            val content: List<ItemDto>,
         ) {
             @Serializable
             class ItemDto(
                 val name: String,
                 val size: Long,
-                val folder: JsonObject? = null,
-                val file: JsonObject? = null,
+                val is_dir: Boolean,
             )
         }
     }
@@ -243,18 +270,19 @@ class BeatZAnime : ParsedAnimeHttpSource() {
     // ============================ Video Links =============================
 
     override suspend fun getVideoList(episode: SEpisode): List<Video> {
-        val url = indexHttpUrl.newBuilder().apply {
-            addPathSegment("api")
-            addPathSegment("raw")
-            addPathSegment("")
-            addQueryParameter("path", episode.url)
-        }.build().toString()
+        val encodedPath = episode.url.split("/").joinToString("/") { segment ->
+            java.net.URLEncoder.encode(segment, "UTF-8").replace("+", "%20")
+        }
 
-        val path = episode.url.substringAfter("/").substringBeforeLast("/") + "/"
+        val url = indexHttpUrl.newBuilder().apply {
+            addPathSegment("d")
+        }.build().toString().removeSuffix("/") + encodedPath
+
+        val refererPath = episode.url.substringBeforeLast("/") + "/"
 
         val videoHeaders = headersBuilder().apply {
             add("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
-            add("Referer", indexHttpUrl.newBuilder().addPathSegments(path).build().toString())
+            add("Referer", indexHttpUrl.newBuilder().addPathSegments(refererPath.removePrefix("/")).build().toString())
         }.build()
 
         return listOf(Video(url, "Video", url, videoHeaders))

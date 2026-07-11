@@ -16,7 +16,7 @@ open class UriPartFilter(
 
 class SourceFilter :
     UriPartFilter(
-        "Status",
+        "Fuente",
         arrayOf(
             Pair("Todos", ""),
             Pair("BDRip", "BDRip"),
@@ -31,7 +31,6 @@ class StatusFilter :
             Pair("Todos", ""),
             Pair("En Emision", "En Emision"),
             Pair("Finalizado", "Finalizado"),
-            Pair("En Proceso", "En Proceso"),
         ),
     )
 
