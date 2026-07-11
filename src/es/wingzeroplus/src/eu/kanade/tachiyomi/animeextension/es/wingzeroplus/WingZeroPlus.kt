@@ -292,19 +292,13 @@ class WingZeroPlus : ParsedAnimeHttpSource() {
         }
     }
 
-    override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
-        val typeFilter = filters.find { it is TypeFilter } as? TypeFilter
-        val isMovie = typeFilter?.toUriPart() == "movies"
+    // Trae TODOS los resultados de un tipo (series o movies) para una búsqueda/filtro dado,
+    // recorriendo todas sus páginas reales de una vez, ya en orden de más nuevo a más viejo.
+    // Se usa solo para el caso "Tipo = Todos", donde no tiene sentido tratar de paginar dos
+    // catálogos (series y movies) con conteos de página independientes a la vez: en su lugar
+    // traemos todo de golpe y se lo entregamos a Aniyomi como una única "página" de resultados.
+    private suspend fun fetchAllResults(isMovie: Boolean, query: String, genreValue: String?, yearValue: String?): List<SAnime> {
         val path = if (isMovie) "movies" else "series"
-
-        // Dispara en segundo plano (no bloqueante) la carga de género/año para este tipo,
-        // por si el usuario cambió a Películas y aún no se cargaron sus opciones.
-        fetchFilterOptions(isMovie)
-
-        val genreValue = (filters.find { it is GenreFilter } as? GenreFilter)?.toUriPart()
-        val yearValue = (filters.find { it is YearFilter } as? YearFilter)?.toUriPart()
-        val hasActiveFilters = query.isNotBlank() || !genreValue.isNullOrBlank() || !yearValue.isNullOrBlank()
-
         fun buildUrl(realPage: Int): String = "$baseUrl/$path".toHttpUrl().newBuilder().apply {
             if (query.isNotBlank()) addQueryParameter("title", query)
             genreValue?.takeIf { it.isNotBlank() }?.let { addQueryParameter("genre", it) }
@@ -312,12 +306,83 @@ class WingZeroPlus : ParsedAnimeHttpSource() {
             addQueryParameter("p", realPage.toString())
         }.build().toString()
 
+        val firstDocument = getDocumentWithRetry(buildUrl(1))
+        val totalPages = parseLastPageNumber(firstDocument)
+
+        val result = mutableListOf<SAnime>()
+        for (realPage in totalPages downTo 1) {
+            val document = if (realPage == 1) firstDocument else getDocumentWithRetry(buildUrl(realPage))
+            result += document.select(searchAnimeSelector())
+                .filter { el -> el.selectFirst("a.uk-position-cover") != null }
+                .map { el -> searchAnimeFromElement(el) }
+                .filter { it.url.isNotBlank() }
+                .reversed()
+        }
+        return result
+    }
+
+    override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
+        val typeFilter = filters.find { it is TypeFilter } as? TypeFilter
+        val typeValue = typeFilter?.toUriPart() ?: "all"
+
+        val genreValue = (filters.find { it is GenreFilter } as? GenreFilter)?.toUriPart()
+        val yearValue = (filters.find { it is YearFilter } as? YearFilter)?.toUriPart()
+        val hasActiveFilters = query.isNotBlank() || !genreValue.isNullOrBlank() || !yearValue.isNullOrBlank()
+
+        // Dispara en segundo plano (no bloqueante) la carga de género/año de Películas,
+        // por si el usuario cambió el Tipo y aún no se cargaron sus opciones. Las de Series
+        // ya se disparan siempre desde init{}.
+        if (typeValue == "movies" || typeValue == "all") fetchFilterOptions(isMovie = true)
+
         // Sin filtros, sin búsqueda de texto y con Tipo = Series: es exactamente el
         // catálogo "populares", reutilizamos la misma lógica de orden invertido global
         // (incluye la precarga de filtros y el caché de total de páginas de populares).
-        if (!hasActiveFilters && !isMovie) {
+        if (!hasActiveFilters && typeValue == "series") {
             return getPopularAnime(page)
         }
+
+        // Tipo = Todos, SIN búsqueda ni filtro: mostramos Series paginadas en el orden
+        // natural del sitio (sin el costo de invertir/contar total, como hace Populares),
+        // y en la primera página agregamos también TODAS las películas existentes. Como
+        // por ahora Películas es una sola página del sitio, esto no es pesado; si en el
+        // futuro creciera mucho, "Todos" seguiría mostrando todo, solo que esa primera
+        // carga tardaría más.
+        if (typeValue == "all" && !hasActiveFilters) {
+            val seriesDocument = getDocumentWithRetry("$baseUrl/series?p=$page")
+            val seriesResults = seriesDocument.select(searchAnimeSelector())
+                .filter { el -> el.selectFirst("a.uk-position-cover") != null }
+                .map { el -> searchAnimeFromElement(el) }
+                .filter { it.url.isNotBlank() }
+            val seriesTotalPages = parseLastPageNumber(seriesDocument)
+            val hasNext = page < seriesTotalPages
+
+            if (page == 1) {
+                val movieResults = fetchAllResults(isMovie = true, query = "", genreValue = null, yearValue = null)
+                return AnimesPage(seriesResults + movieResults, hasNext)
+            }
+            return AnimesPage(seriesResults, hasNext)
+        }
+
+        // Tipo = Todos, CON búsqueda/filtro activo: traemos series y películas completas
+        // (para esa búsqueda/filtro puntual) y las combinamos en una sola lista, series
+        // primero y luego películas. No hay paginación real en este caso: se entrega todo
+        // junto de una vez.
+        if (typeValue == "all") {
+            if (page > 1) return AnimesPage(emptyList(), false)
+            val seriesResults = fetchAllResults(isMovie = false, query, genreValue, yearValue)
+            val movieResults = fetchAllResults(isMovie = true, query, genreValue, yearValue)
+            return AnimesPage(seriesResults + movieResults, false)
+        }
+
+        val isMovie = typeValue == "movies"
+        val path = if (isMovie) "movies" else "series"
+
+        fun buildUrl(realPage: Int): String = "$baseUrl/$path".toHttpUrl().newBuilder().apply {
+            if (query.isNotBlank()) addQueryParameter("title", query)
+            genreValue?.takeIf { it.isNotBlank() }?.let { addQueryParameter("genre", it) }
+            yearValue?.takeIf { it.isNotBlank() }?.let { addQueryParameter("year", it) }
+            addQueryParameter("p", realPage.toString())
+        }.build().toString()
 
         // Con filtros/búsqueda activos, el sitio también pagina de más antiguo a más
         // reciente, así que aplicamos el mismo criterio: total real de páginas primero,
@@ -503,6 +568,7 @@ class WingZeroPlus : ParsedAnimeHttpSource() {
         UriPartFilter(
             "Tipo de contenido",
             arrayOf(
+                Pair("Todos", "all"),
                 Pair("Series", "series"),
                 Pair("Películas", "movies"),
             ),
