@@ -122,7 +122,7 @@ internal class MegaApi(private val client: OkHttpClient) {
         // de romper el resto del listado.
         for (raw in rawNodes) {
             val parentFolderKey = raw.p?.let { folderKeys[it] } ?: folderKeyRaw
-            val nodeKeyRaw = raw.k?.let { decryptNodeKey(it, parentFolderKey) }
+            val nodeKeyRaw = raw.k?.let { decryptNodeKey(it, parentFolderKey, raw.p) }
             if (rootNodeHandle == null) rootNodeHandle = raw.h
 
             val (fileKeyMaterial, folderMasterKey) = when {
@@ -251,13 +251,38 @@ internal class MegaApi(private val client: OkHttpClient) {
      * nodo fue compartido con múltiples usuarios; en ese caso alcanza con
      * encontrar el primer par que se logre descifrar con la key del padre.
      */
-    private fun decryptNodeKey(kField: String, parentFolderKey: ByteArray): ByteArray? {
-        val pairs = kField.split("/")
-        for (pair in pairs) {
+    // BUG REAL (confirmado con datos reales de la API, carpeta "Rakudai
+    // Kishi no Cavalry", episodio 05): el campo "k" de un nodo puede traer
+    // MÁS DE UN PAR "handle:key" separados por "/" cuando el archivo tiene
+    // keys asociadas a más de un contexto/carpeta (p.ej. fue movido o
+    // comparte permisos con otra carpeta). Ejemplo real:
+    //   "5BpV3J6L:2QOv...buA/tdoTBbyA:xd1o...VAM"
+    // La versión anterior probaba los pares EN ORDEN y se quedaba con el
+    // primero que no lanzara excepción al descifrar -- pero descifrar con
+    // la key equivocada (la de "5BpV3J6L", que no es el handle del padre
+    // real de este nodo) NO siempre lanza excepción: el AES-ECB igual
+    // produce 16 o 32 bytes válidos, solo que son basura. Eso hacía que el
+    // nombre del archivo nunca se recuperara para ese nodo puntual, aunque
+    // los datos SÍ estaban completos y correctos en la respuesta de la API.
+    //
+    // El fix: usar el handle que antecede a los ":" para elegir el par que
+    // corresponde al padre real (parentHandle) conocido por el llamador. Si
+    // ningún par calza con ese handle (no debería pasar en la práctica, pero
+    // por si acaso), se cae al comportamiento anterior como último recurso.
+    private fun decryptNodeKey(kField: String, parentFolderKey: ByteArray, parentHandle: String? = null): ByteArray? {
+        val pairs = kField.split("/").mapNotNull { pair ->
             val idx = pair.indexOf(":")
-            if (idx == -1) continue
-            val blob = pair.substring(idx + 1)
+            if (idx == -1) null else pair.substring(0, idx) to pair.substring(idx + 1)
+        }
 
+        val matchingPair = parentHandle?.let { h -> pairs.firstOrNull { it.first == h } }
+        val orderedBlobs = if (matchingPair != null) {
+            listOf(matchingPair.second) + pairs.filter { it != matchingPair }.map { it.second }
+        } else {
+            pairs.map { it.second }
+        }
+
+        for (blob in orderedBlobs) {
             val decrypted = try {
                 val cipherBytes = MegaCrypto.megaBase64Decode(blob)
                 MegaCrypto.aesEcbDecrypt(parentFolderKey, cipherBytes)

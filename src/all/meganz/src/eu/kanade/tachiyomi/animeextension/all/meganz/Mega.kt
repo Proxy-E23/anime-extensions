@@ -4,6 +4,7 @@ import android.content.SharedPreferences
 import androidx.preference.EditTextPreference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
+import aniyomi.lib.filenameutils.FilenameUtils
 import aniyomi.lib.megaextractor.MegaExtractor
 import aniyomi.lib.megaextractor.MegaLink
 import aniyomi.lib.megaextractor.MegaNode
@@ -286,7 +287,7 @@ class Mega :
             .sortedWith(
                 compareByDescending<MegaNode> { classifySpecialEpisode(it.name) != null }
                     .thenBy { classifySpecialEpisode(it.name)?.type?.sortOrder ?: Int.MAX_VALUE }
-                    .thenByDescending { classifySpecialEpisode(it.name)?.number ?: extractEpisodeNumber(it.name) ?: Int.MIN_VALUE },
+                    .thenByDescending { classifySpecialEpisode(it.name)?.number ?: FilenameUtils.extractEpisodeNumber(it.name)?.toInt() ?: Int.MIN_VALUE },
             )
 
         if (videoNodes.isEmpty()) {
@@ -306,7 +307,7 @@ class Mega :
 
         return videoNodes.map { node ->
             val special = classifySpecialEpisode(node.name)
-            val realNumber = special?.number ?: extractEpisodeNumber(node.name)
+            val realNumber = special?.number ?: FilenameUtils.extractEpisodeNumber(node.name)?.toInt()
 
             SEpisode.create().apply {
                 name = if (showFilename) {
@@ -324,14 +325,30 @@ class Mega :
                     "Episodio ${realNumber ?: "?"}"
                 }
                 url = MegaEpisodeData(fileHandle = node.handle, fileKey = null, folderHandle = link.handle).toJsonString()
-                // episode_number es lo que usan los trackers (AniList/MAL)
-                // para hacer match. Los especiales usan un rango negativo
-                // propio por tipo, para no chocar entre sí ni con los
-                // episodios reales (siempre positivos, o 0 si existe un
-                // episodio 0). Sin esto, un OP/ED se contaría como si fuera
-                // el episodio 1 y desincronizaría el seguimiento del usuario.
+                // episode_number es lo que usan tanto Aniyomi/Anikku (para
+                // calcular episodios "missing"/huecos en la lista) como los
+                // trackers (AniList/MAL) para hacer match.
+                //
+                // BUG REAL (confirmado con datos de usuario, carpeta "Ao no
+                // Hako"): los especiales usaban un offset negativo propio
+                // por tipo (OP=-1000, ED=-2000...) para no chocar con los
+                // episodios reales. Pero Anikku calcula "missing items"
+                // mirando el RANGO entre el episode_number más chico y el
+                // más grande de toda la lista -- con un ED2 en -2002 y un
+                // episodio real en 20, ese rango es de -2002 a 20, ¡2022
+                // números de por medio!, casi todos inexistentes por
+                // diseño. Eso es exactamente lo que se veía como "Missing
+                // 2001 items".
+                //
+                // Fix: los especiales usan 0F, el valor estándar en
+                // Aniyomi/Tachiyomi para "no participa en el conteo
+                // secuencial de episodios". Ya no chocan con el episodio 0
+                // real (si existe) porque ese caso sí se cuenta aparte más
+                // abajo: un episodio 0 real siempre viene de `realNumber`,
+                // nunca de `special`, así que no hay ambigüedad entre "OP/ED
+                // sin número secuencial" y "episodio 0 real".
                 episode_number = when {
-                    special != null -> (special.type.baseOffset - (special.number ?: 0)).toFloat()
+                    special != null -> 0F
                     realNumber != null -> realNumber.toFloat()
                     else -> -9999F
                 }
@@ -341,12 +358,12 @@ class Mega :
         }
     }
 
-    private enum class SpecialEpisodeType(val label: String, val sortOrder: Int, val baseOffset: Int) {
-        OP("OP", 0, -1000),
-        ED("ED", 1, -2000),
-        OVA("OVA", 2, -3000),
-        SPECIAL("Special", 3, -4000),
-        EXTRA("Extra", 4, -5000),
+    private enum class SpecialEpisodeType(val label: String, val sortOrder: Int) {
+        OP("OP", 0),
+        ED("ED", 1),
+        OVA("OVA", 2),
+        SPECIAL("Special", 3),
+        EXTRA("Extra", 4),
     }
 
     private data class SpecialEpisodeInfo(val type: SpecialEpisodeType, val number: Int?)
@@ -362,41 +379,42 @@ class Mega :
     // lookahead exige que a "OP" le siga un dígito, un espacio, el final del
     // nombre, o un símbolo -- pero NUNCA otra letra -- así "OPTIMUS" sigue
     // sin dispararlo (ahí sigue "T", una letra).
+    //
+    // BUG REAL encontrado con nombres de usuario (p.ej.
+    // "[HaibaneSubs]Ao_no_Hako_-_OP.mkv"): \b tampoco separa una letra de un
+    // GUION BAJO pegado, porque \w incluye "_" -- así que "_OP" no tenía
+    // boundary ahí y el archivo no se detectaba como especial. Se normaliza
+    // "_" a espacio antes de aplicar los regex de clasificación (el nombre
+    // que se guarda/muestra en SpecialEpisodeInfo sigue usando el original).
     private fun classifySpecialEpisode(name: String): SpecialEpisodeInfo? {
         val withoutExt = name.substringBeforeLast('.')
+        val forMatching = withoutExt.replace('_', ' ')
         val type = when {
-            Regex("""(?i)\bNCOP\b|\bOP(?=\d|\s|$|[^a-zA-Z0-9])|opening""").containsMatchIn(withoutExt) -> SpecialEpisodeType.OP
-            Regex("""(?i)\bNCED\b|\bED(?=\d|\s|$|[^a-zA-Z0-9])|ending""").containsMatchIn(withoutExt) -> SpecialEpisodeType.ED
-            Regex("""(?i)\bOVA(?=\d|\s|$|[^a-zA-Z0-9])""").containsMatchIn(withoutExt) -> SpecialEpisodeType.OVA
-            Regex("""(?i)\bespecial(es)?\b|\bspecial\b""").containsMatchIn(withoutExt) -> SpecialEpisodeType.SPECIAL
-            Regex("""(?i)\bextra(s)?\b""").containsMatchIn(withoutExt) -> SpecialEpisodeType.EXTRA
+            Regex("""(?i)\bNCOP\b|\bOP(?=\d|\s|$|[^a-zA-Z0-9])|opening""").containsMatchIn(forMatching) -> SpecialEpisodeType.OP
+            Regex("""(?i)\bNCED\b|\bED(?=\d|\s|$|[^a-zA-Z0-9])|ending""").containsMatchIn(forMatching) -> SpecialEpisodeType.ED
+            Regex("""(?i)\bOVA(?=\d|\s|$|[^a-zA-Z0-9])""").containsMatchIn(forMatching) -> SpecialEpisodeType.OVA
+            Regex("""(?i)\bespecial(es)?\b|\bspecial\b""").containsMatchIn(forMatching) -> SpecialEpisodeType.SPECIAL
+            Regex("""(?i)\bextra(s)?\b""").containsMatchIn(forMatching) -> SpecialEpisodeType.EXTRA
             else -> return null
         }
         // Número pegado o cercano a la palabra clave (p.ej. "OP2", "OP 2",
-        // "ED-01"), buscando el último grupo de dígitos del nombre igual que
-        // extractEpisodeNumber, ya que openings/endings casi siempre traen el
-        // número (si lo tienen) al final del nombre, antes de la extensión.
-        val number = Regex("""(\d+)\s*$""").find(withoutExt)?.groupValues?.get(1)?.toIntOrNull()
+        // "ED-01"). Se usa FilenameUtils.extractTrailingNumber (no
+        // extractEpisodeNumber): esta última descarta a propósito los tags
+        // OP/ED con número pegado por considerarlos "sin episodio real",
+        // pero aquí el archivo YA fue identificado como especial y sí hace
+        // falta leer ese número pegado (p.ej. para mostrar "OP 2").
+        // extractTrailingNumber además limpia corchetes/paréntesis antes de
+        // buscar -- el regex anterior (\d+\s*$ directo sobre el nombre
+        // crudo) fallaba en nombres reales como "[FS] Rakudai Kishi no
+        // Cavalry 08 (BD 1920x1080 x264 AAC) [35E5A43B].mp4", donde el
+        // último número antes de la extensión es parte del hash/resolución.
+        val number = FilenameUtils.extractTrailingNumber(withoutExt)?.toInt()
         return SpecialEpisodeInfo(type, number)
     }
 
     private fun isVideoName(name: String): Boolean {
         val ext = name.substringAfterLast('.', "").lowercase()
         return ext in VIDEO_EXTENSIONS
-    }
-
-    // Toma el último grupo de dígitos del nombre (antes de la extensión, si
-    // es posible) como número de episodio. Ejemplos:
-    //   "[HaibaneSubs] Ragna Crimson - 13.mkv" -> 13
-    //   "Episodio 09.mkv" -> 9
-    //   "[HaibaneSubs] Seishun Buta Yarou...[1080p AVC E-AC3].mkv" -> null
-    //     (el "1080" que aparece ahí NO cuenta: solo se buscan números que
-    //     estén inmediatamente antes de la extensión de archivo, ya que un
-    //     número de resolución/codec en medio del nombre no es el episodio)
-    private fun extractEpisodeNumber(name: String): Int? {
-        val withoutExt = name.substringBeforeLast('.')
-        val match = Regex("""(\d+)\s*$""").find(withoutExt) ?: return null
-        return match.groupValues[1].toIntOrNull()
     }
 
     private fun formatBytes(bytes: Long): String = when {

@@ -1,11 +1,12 @@
 ext {
     extName = 'MEGA'
     extClass = '.Mega'
-    extVersionCode = 2
+    extVersionCode = 3
 }
 
 apply plugin: "kei.plugins.extension.legacy"
 
 dependencies {
     implementation(project(':lib:megaextractor'))
+    implementation(project(':lib:filenameutils'))
 }
