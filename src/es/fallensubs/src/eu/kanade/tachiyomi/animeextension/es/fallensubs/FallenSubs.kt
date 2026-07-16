@@ -330,22 +330,35 @@ class FallenSubs : ParsedAnimeHttpSource() {
 
         document.select(episodeListSelector()).forEach { table ->
             val headerCells = table.select("tr").firstOrNull()?.select("td, th") ?: return@forEach
-            val qualityNames = headerCells.drop(1).map { it.text().trim() }
+            // Solo saltamos la primera celda si es una etiqueta de fila ("CAPITULO", "EP",
+            // etc.); algunas tablas empiezan directo con la calidad (ej. "1080p").
+            val firstHeaderText = headerCells.firstOrNull()?.text()?.trim().orEmpty()
+            val hasRowLabelColumn = ROW_LABEL_HEADER_REGEX.matches(firstHeaderText)
+            val qualityHeaderCells = if (hasRowLabelColumn) headerCells.drop(1) else headerCells
+            val qualityNames = qualityHeaderCells.map { it.text().trim() }
+            val columnOffset = if (hasRowLabelColumn) 1 else 0
+
             // Solo la mejor resolución disponible (idealmente 1080p): ignoramos 720p y
-            // menores. Columnas sin resolución reconocible (ej. "BD", "OP Credless") no se
-            // descartan, para no perder contenido válido por accidente.
+            // menores. Columnas sin resolución reconocible no se descartan aquí para no
+            // perder contenido válido; se filtran más abajo si hace falta.
             val bestQuality = qualityNames.mapNotNull { extractResolution(it) }.maxOrNull()
-            val allowedIndices = qualityNames.indices.filter { index ->
+            val resolutionCandidates = qualityNames.indices.filter { index ->
                 val resolution = extractResolution(qualityNames[index])
                 bestQuality == null || resolution == null || resolution == bestQuality
-            }.toSet()
+            }
+            val allowedIndices = pickBestQualityIndices(resolutionCandidates, qualityNames).toSet()
 
             table.select("tr").drop(1).forEach { row ->
                 val cells = row.select("td")
                 if (cells.isEmpty()) return@forEach
-                val rowName = cells.first()?.text()?.trim().orEmpty().ifBlank { "Batch" }
+                val rowName = if (hasRowLabelColumn) {
+                    cells.first()?.text()?.trim().orEmpty().ifBlank { "Batch" }
+                } else {
+                    "Batch"
+                }
+                val dataCells = if (columnOffset > 0) cells.drop(columnOffset) else cells
 
-                cells.drop(1).forEachIndexed { index, cell ->
+                dataCells.forEachIndexed { index, cell ->
                     if (index !in allowedIndices) return@forEachIndexed
                     val megaHref = cell.selectFirst("a[href*=mega.nz]")?.attr("href") ?: return@forEachIndexed
                     val quality = qualityNames.getOrNull(index) ?: "Descarga"
@@ -386,6 +399,35 @@ class FallenSubs : ParsedAnimeHttpSource() {
     }
 
     private fun extractResolution(qualityText: String): Int? = RESOLUTION_REGEX.find(qualityText)?.groupValues?.get(1)?.toIntOrNull()
+
+    private fun extractBitDepth(qualityText: String): Int? = BITDEPTH_REGEX.find(qualityText)?.groupValues?.get(1)?.toIntOrNull()
+
+    private fun isMp4Format(qualityText: String): Boolean = qualityText.contains("mp4", ignoreCase = true)
+
+    private fun isAviFormat(qualityText: String): Boolean = qualityText.contains("avi", ignoreCase = true)
+
+    // Prioridad para desambiguar columnas duplicadas del mismo capítulo: resolución
+    // explícita (mayor bitdepth en empate) > MP4 > AVI como último recurso.
+    private fun pickBestQualityIndices(candidates: List<Int>, qualityNames: List<String>): List<Int> {
+        if (candidates.size <= 1) return candidates
+
+        val withResolution = candidates.filter { extractResolution(qualityNames[it]) != null }
+        if (withResolution.isNotEmpty()) {
+            val bestBitDepth = withResolution.mapNotNull { extractBitDepth(qualityNames[it]) }.maxOrNull()
+            return withResolution.filter { index ->
+                val bitDepth = extractBitDepth(qualityNames[index])
+                bestBitDepth == null || bitDepth == null || bitDepth == bestBitDepth
+            }
+        }
+
+        val mp4Indices = candidates.filter { isMp4Format(qualityNames[it]) }
+        if (mp4Indices.isNotEmpty()) return mp4Indices
+
+        val nonAviIndices = candidates.filter { !isAviFormat(qualityNames[it]) }
+        if (nonAviIndices.isNotEmpty()) return nonAviIndices
+
+        return candidates
+    }
 
     private fun encodeEpisodeUrl(megaHref: String, handle: String, displayName: String): String = "$megaHref|$handle|$displayName"
 
@@ -431,6 +473,13 @@ class FallenSubs : ParsedAnimeHttpSource() {
         private const val LATEST_PAGE_SIZE = 20
         private val SECTION_HEADER_REGEX = Regex("""(DATOS DE LA SERIE|FICHA TECNICA|SINOPSIS|STAFF FALLENSUBS)""")
         private val RESOLUTION_REGEX = Regex("""(\d{3,4})p?""")
+        private val BITDEPTH_REGEX = Regex("""(\d{1,2})\s*bits?""", RegexOption.IGNORE_CASE)
+
+        // Etiqueta de columna de fila (no una calidad): "CAPITULO", "CAP", "EPISODIO", "EP".
+        private val ROW_LABEL_HEADER_REGEX = Regex(
+            """^(cap[ií]tulo|cap\.?|episodio|ep\.?)$""",
+            RegexOption.IGNORE_CASE,
+        )
 
         // Ejemplo real: "Julio 11, 2026, 09:00:20 am"
         private val SPANISH_DATE_REGEX = Regex(
