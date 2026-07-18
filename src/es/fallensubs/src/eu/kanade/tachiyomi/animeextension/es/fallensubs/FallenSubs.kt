@@ -1,9 +1,11 @@
 package eu.kanade.tachiyomi.animeextension.es.fallensubs
 
 import android.app.Application
+import androidx.preference.PreferenceScreen
 import aniyomi.lib.filenameutils.FilenameUtils
 import aniyomi.lib.megaextractor.MegaExtractor
 import aniyomi.lib.megaextractor.MegaLink
+import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.AnimesPage
 import eu.kanade.tachiyomi.animesource.model.SAnime
@@ -12,6 +14,8 @@ import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.animesource.online.ParsedAnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.util.asJsoup
+import keiyoushi.utils.addSwitchPreference
+import keiyoushi.utils.getPreferencesLazy
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
@@ -22,7 +26,9 @@ import org.jsoup.nodes.Element
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
 
-class FallenSubs : ParsedAnimeHttpSource() {
+class FallenSubs :
+    ParsedAnimeHttpSource(),
+    ConfigurableAnimeSource {
 
     override val name = "FallenSubs"
     override val baseUrl = "https://www.fallensubs.com"
@@ -32,6 +38,11 @@ class FallenSubs : ParsedAnimeHttpSource() {
     private val forumUrl = "$baseUrl/forum"
 
     private val extractor by lazy { MegaExtractor(client) }
+
+    private val preferences by getPreferencesLazy()
+
+    private val showFilename: Boolean
+        get() = FallenSubsPreferences.showFilename(preferences)
 
     // El "anime" es siempre el topic del foro (index.php?topic=XXXX.0): ahí está todo lo que
     // necesitamos (portada, sinopsis, tabla de descargas).
@@ -326,7 +337,9 @@ class FallenSubs : ParsedAnimeHttpSource() {
 
     override fun episodeListParse(response: Response): List<SEpisode> {
         val document = response.asJsoup()
-        val episodes = mutableListOf<SEpisode>()
+        // Se guarda junto al rawName real de cada archivo (nombre real, no el label ya
+        // transformado por showFilename) para poder ordenar sin volver a parsear texto.
+        val episodes = mutableListOf<Pair<SEpisode, String>>()
 
         document.select(episodeListSelector()).forEach { table ->
             val headerCells = table.select("tr").firstOrNull()?.select("td, th") ?: return@forEach
@@ -372,30 +385,30 @@ class FallenSubs : ParsedAnimeHttpSource() {
                                 emptyList()
                             }
                             nodes.filter { !it.isFolder }.forEach { node ->
-                                episodes.add(
-                                    SEpisode.create().apply {
-                                        name = "${node.name} [$quality]"
-                                        url = encodeEpisodeUrl(megaHref, node.handle, node.name)
-                                        episode_number = FilenameUtils.extractEpisodeNumber(node.name) ?: 0F
-                                    },
-                                )
+                                val display = FilenameUtils.buildEpisodeDisplay(node.name, showFilename)
+                                val episode = SEpisode.create().apply {
+                                    name = if (showFilename) "${display.name} [$quality]" else display.name
+                                    url = encodeEpisodeUrl(megaHref, node.handle, node.name)
+                                    episode_number = display.episodeNumber
+                                }
+                                episodes.add(episode to node.name)
                             }
                         }
                         is MegaLink.File -> {
-                            episodes.add(
-                                SEpisode.create().apply {
-                                    name = "$rowName [$quality]"
-                                    url = encodeEpisodeUrl(megaHref, link.handle, rowName)
-                                    episode_number = FilenameUtils.extractEpisodeNumber(rowName) ?: 0F
-                                },
-                            )
+                            val display = FilenameUtils.buildEpisodeDisplay(rowName, showFilename)
+                            val episode = SEpisode.create().apply {
+                                name = if (showFilename) "${display.name} [$quality]" else display.name
+                                url = encodeEpisodeUrl(megaHref, link.handle, rowName)
+                                episode_number = display.episodeNumber
+                            }
+                            episodes.add(episode to rowName)
                         }
                     }
                 }
             }
         }
 
-        return FilenameUtils.sortByEpisodeNumberDescending(episodes) { it.name }
+        return FilenameUtils.sortByEpisodeNumberDescending(episodes) { it.second }.map { it.first }
     }
 
     private fun extractResolution(qualityText: String): Int? = RESOLUTION_REGEX.find(qualityText)?.groupValues?.get(1)?.toIntOrNull()
@@ -439,6 +452,17 @@ class FallenSubs : ParsedAnimeHttpSource() {
             megaHref = parts.getOrElse(0) { "" },
             handle = parts.getOrElse(1) { "" },
             displayName = parts.getOrElse(2) { "" },
+        )
+    }
+
+    // ============================ Preferencias ===============================
+
+    override fun setupPreferenceScreen(screen: PreferenceScreen) {
+        screen.addSwitchPreference(
+            key = FallenSubsPreferences.PREF_SHOW_FILENAME,
+            default = false,
+            title = "Mostrar nombre del archivo",
+            summary = "Activado: muestra el nombre real del archivo.\nDesactivado: muestra \"Episodio 1\", \"Episodio 2\"…",
         )
     }
 

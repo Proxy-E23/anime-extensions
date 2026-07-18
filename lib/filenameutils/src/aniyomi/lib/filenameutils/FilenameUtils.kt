@@ -115,13 +115,19 @@ object FilenameUtils {
      * [sortByEpisodeNumberDescending] -- no afecta [extractEpisodeNumber].
      *
      * [sortPriority] define el orden de los bloques (0 = primero):
-     * Insert Song -> Ending -> Opening -> Special -> OVA -> Movie -> Episode.
+     * Insert Song -> Ending -> Opening -> Special/Extra -> OVA -> Movie ->
+     * Episode.
+     *
+     * SPECIAL y EXTRA comparten el mismo bloque (mismo [sortPriority]),
+     * pero SPECIAL siempre se ordena antes que EXTRA dentro de ese bloque
+     * -- ver [sortByEpisodeNumberDescending].
      */
     enum class EpisodeCategory(val sortPriority: Int) {
         INSERT_SONG(0),
         ENDING(1),
         OPENING(2),
         SPECIAL(3),
+        EXTRA(3),
         OVA(4),
         MOVIE(5),
         EPISODE(6),
@@ -137,6 +143,7 @@ object FilenameUtils {
         EpisodeCategory.ENDING to Regex("""\b(?:nc)?ed\d*\b""", RegexOption.IGNORE_CASE),
         EpisodeCategory.OPENING to Regex("""\b(?:nc)?op\d*\b""", RegexOption.IGNORE_CASE),
         EpisodeCategory.SPECIAL to Regex("""\b(?:special|especial|sp)\b""", RegexOption.IGNORE_CASE),
+        EpisodeCategory.EXTRA to Regex("""\bextra(?:s)?\b""", RegexOption.IGNORE_CASE),
         EpisodeCategory.OVA to Regex("""\b(?:ova|oav)\b""", RegexOption.IGNORE_CASE),
         EpisodeCategory.MOVIE to Regex("""\b(?:movie|film|pel[ií]cula)\b""", RegexOption.IGNORE_CASE),
     )
@@ -151,7 +158,11 @@ object FilenameUtils {
     fun detectCategory(rawName: String): EpisodeCategory {
         val normalized = rawName.replace(Regex("""\s+"""), " ").trim()
         val withoutBrackets = BRACKETED_CONTENT_REGEX.replace(normalized, " ")
-        return CATEGORY_PATTERNS.firstOrNull { (_, pattern) -> pattern.containsMatchIn(withoutBrackets) }
+        // "_" cuenta como carácter de palabra para \b, así que "_OP" no
+        // tiene boundary ahí y no dispararía ningún patrón de CATEGORY_PATTERNS
+        // sin este reemplazo (ej. "Serie_-_OP.mkv").
+        val forMatching = withoutBrackets.replace('_', ' ')
+        return CATEGORY_PATTERNS.firstOrNull { (_, pattern) -> pattern.containsMatchIn(forMatching) }
             ?.first
             ?: EpisodeCategory.EPISODE
     }
@@ -171,6 +182,9 @@ object FilenameUtils {
      */
     fun <T> sortByEpisodeNumberDescending(items: List<T>, nameSelector: (T) -> String): List<T> = items.sortedWith(
         compareBy<T> { detectCategory(nameSelector(it)).sortPriority }
+            // SPECIAL y EXTRA comparten sortPriority; este paso desempata
+            // para que SPECIAL siempre quede antes que EXTRA dentro de ese bloque.
+            .thenBy { detectCategory(nameSelector(it)) == EpisodeCategory.EXTRA }
             .thenByDescending { item ->
                 val category = detectCategory(nameSelector(item))
                 val hasNumber = extractEpisodeNumber(nameSelector(item)) != null
@@ -178,4 +192,84 @@ object FilenameUtils {
             }
             .thenByDescending { extractEpisodeNumber(nameSelector(it)) ?: Float.NEGATIVE_INFINITY },
     )
+
+    // Etiqueta corta para mostrar en el nombre del episodio cuando no es
+    // un episodio normal (ej. "OP 2", "Special", "Extra 1"). EPISODE no
+    // tiene label propio porque su nombre se arma distinto (ver
+    // [buildEpisodeDisplay]: "Episodio {n}").
+    private val EpisodeCategory.label: String
+        get() = when (this) {
+            EpisodeCategory.INSERT_SONG -> "IS"
+            EpisodeCategory.OPENING -> "OP"
+            EpisodeCategory.ENDING -> "ED"
+            EpisodeCategory.SPECIAL -> "Special"
+            EpisodeCategory.EXTRA -> "Extra"
+            EpisodeCategory.OVA -> "OVA"
+            EpisodeCategory.MOVIE -> "Movie"
+            EpisodeCategory.EPISODE -> "Episodio"
+        }
+
+    /**
+     * Nombre a mostrar y episode_number a asignar para un archivo,
+     * resueltos juntos porque ambos dependen del mismo análisis del
+     * nombre (categoría + número extraído).
+     *
+     * @param name nombre mostrado (según [showFilename])
+     * @param episodeNumber valor listo para asignar a `SEpisode.episode_number`
+     */
+    data class EpisodeDisplay(val name: String, val episodeNumber: Float)
+
+    /**
+     * Resuelve en una sola llamada lo que casi todas las extensiones que
+     * listan episodios por nombre de archivo necesitan repetir: el nombre
+     * a mostrar (nombre real del archivo, o una etiqueta genérica como
+     * "Episodio 4"/"OP 2" si el usuario prefiere ocultar el nombre real) y
+     * el `episode_number` correcto para ese archivo.
+     *
+     * Los especiales (cualquier categoría que no sea EPISODE) usan `0F`
+     * como episode_number -- el valor estándar en Aniyomi/Tachiyomi para
+     * "no participa en el conteo secuencial de episodios". Usar un offset
+     * propio por tipo (como -1000, -2000...) rompe el cálculo de
+     * "episodios faltantes" de Aniyomi/Anikku, que mira el rango completo
+     * entre el episode_number más chico y el más grande de toda la lista:
+     * con un especial en -2000 y un episodio real en 20, ese rango pasa a
+     * ser de -2000 a 20, la mayoría de esos números inexistentes por
+     * diseño -- eso se ve en la app como miles de "episodios faltantes".
+     *
+     * @param rawName nombre real del archivo
+     * @param showFilename si `true`, [EpisodeDisplay.name] es `rawName` tal
+     *   cual; si `false`, se arma una etiqueta genérica ("Episodio 4",
+     *   "OP 2", "Special") según la categoría y número detectados
+     */
+    fun buildEpisodeDisplay(rawName: String, showFilename: Boolean): EpisodeDisplay {
+        val category = detectCategory(rawName)
+        val number = if (category == EpisodeCategory.EPISODE) {
+            extractEpisodeNumber(rawName)
+        } else {
+            extractTrailingNumber(rawName)
+        }
+
+        val name = when {
+            showFilename -> rawName
+            category == EpisodeCategory.EPISODE -> "Episodio ${number?.let { formatEpisodeNumber(it) } ?: "?"}"
+            number != null -> "${category.label} ${formatEpisodeNumber(number)}"
+            else -> category.label
+        }
+
+        val episodeNumber = when {
+            category != EpisodeCategory.EPISODE -> 0F
+            number != null -> number
+            else -> -9999F
+        }
+
+        return EpisodeDisplay(name, episodeNumber)
+    }
+
+    // "12.0" se muestra como "12" (sin el ".0" redundante); "12.5" se
+    // muestra tal cual, para no perder el episodio parcial.
+    private fun formatEpisodeNumber(number: Float): String = if (number == number.toInt().toFloat()) {
+        number.toInt().toString()
+    } else {
+        number.toString()
+    }
 }
