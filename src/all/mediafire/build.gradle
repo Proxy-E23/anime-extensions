@@ -1,7 +1,12 @@
 ext {
     extName = 'MediaFire'
     extClass = '.MediaFireSrc'
-    extVersionCode = 4
+    extVersionCode = 5
 }
 
 apply plugin: "kei.plugins.extension.legacy"
+
+dependencies {
+    implementation(project(':lib:filenameutils'))
+    implementation(project(':lib:mediafireextractor'))
+}
