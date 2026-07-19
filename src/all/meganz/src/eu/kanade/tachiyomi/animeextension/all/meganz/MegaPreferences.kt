@@ -32,16 +32,32 @@ object MegaPreferences {
     }
 
     /**
-     * Elimina una entrada por coincidencia exacta de la línea completa
-     * "Nombre::URL", tal como se le pide al usuario copiar desde la
-     * descripción de una entrada con error. Devuelve el texto actualizado
-     * para que la UI (EditTextPreference) pueda refrescarse sin releer prefs.
+     * Busca si una URL ya está guardada, para evitar agregarla dos veces
+     * (ver getSearchAnime en Mega.kt).
      */
-    fun removeEntryByLine(prefs: SharedPreferences, exactLine: String): String {
+    fun findByUrl(prefs: SharedPreferences, url: String): Entry? = getEntries(prefs).firstOrNull { it.url == url }
+
+    /**
+     * Elimina una entrada a partir de la URL o el nombre que el usuario
+     * pegue en "Eliminar enlace", por match exacto. Solo borra si el valor
+     * identifica una única entrada; si hay ambigüedad, no borra nada.
+     * También acepta la línea completa "Nombre::URL" (compatibilidad con el
+     * flujo de entradas con error404).
+     */
+    fun removeEntryByLine(prefs: SharedPreferences, pasted: String): String {
+        val input = pasted.trim()
+        val entries = getEntries(prefs)
+        val inputUrl = input.substringAfter("::", input).trim()
+
+        val urlMatches = entries.filter { it.url == inputUrl }
+        val nameMatches = entries.filter { it.name == input }
+
         val current = prefs.getString(PREF_KEY, "") ?: ""
-        val updated = current.lines()
-            .filter { it.trim() != exactLine.trim() }
-            .joinToString("\n")
+        val updated = when {
+            urlMatches.size == 1 -> current.lines().filter { it.substringAfter("::", "").trim() != inputUrl }.joinToString("\n")
+            nameMatches.size == 1 -> current.lines().filter { it.substringBefore("::", it).trim() != input }.joinToString("\n")
+            else -> current
+        }
         prefs.edit().putString(PREF_KEY, updated).apply()
         return updated
     }
