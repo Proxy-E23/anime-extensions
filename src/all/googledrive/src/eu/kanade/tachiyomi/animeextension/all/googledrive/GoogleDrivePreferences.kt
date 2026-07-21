@@ -6,7 +6,8 @@ object GoogleDrivePreferences {
 
     data class Entry(val name: String, val url: String)
 
-    private const val PREF_KEY = "googledrive_folder_list"
+    const val PREF_KEY = "googledrive_folder_list"
+    const val REMOVE_ENTRY_KEY = "googledrive_remove_entry"
 
     fun getEntries(prefs: SharedPreferences): List<Entry> {
         val raw = prefs.getString(PREF_KEY, "") ?: return emptyList()
@@ -30,14 +31,39 @@ object GoogleDrivePreferences {
         prefs.edit().putString(PREF_KEY, updated).apply()
     }
 
-    fun removeEntry(prefs: SharedPreferences, url: String) {
-        val current = prefs.getString(PREF_KEY, "") ?: return
-        val updated = current.lines()
-            .filter { url !in it }
-            .joinToString("\n")
+    /**
+     * Busca si una URL ya está guardada, para evitar agregarla dos veces
+     * (ver getSearchAnime en GoogleDrive.kt).
+     */
+    fun findByUrl(prefs: SharedPreferences, url: String): Entry? = getEntries(prefs).firstOrNull { it.url == url }
+
+    /**
+     * Elimina una entrada a partir de la URL o el nombre que el usuario
+     * pegue en "Eliminar enlace", por match exacto. Solo borra si el valor
+     * identifica una única entrada; si hay ambigüedad, no borra nada.
+     */
+    fun removeEntryByLine(prefs: SharedPreferences, pasted: String): String {
+        val input = pasted.trim()
+        val entries = getEntries(prefs)
+        val inputUrl = input.substringAfter("::", input).trim()
+
+        val urlMatches = entries.filter { it.url == inputUrl }
+        val nameMatches = entries.filter { it.name == input }
+
+        val current = prefs.getString(PREF_KEY, "") ?: ""
+        val updated = when {
+            urlMatches.size == 1 -> current.lines().filter { it.substringAfter("::", "").trim() != inputUrl }.joinToString("\n")
+            nameMatches.size == 1 -> current.lines().filter { it.substringBefore("::", it).trim() != input }.joinToString("\n")
+            else -> current
+        }
         prefs.edit().putString(PREF_KEY, updated).apply()
+        return updated
     }
 
+    /**
+     * No se usa actualmente en GoogleDrive.kt -- se deja como base para una
+     * función futura de renombrado de entradas guardadas. No eliminar.
+     */
     fun updateEntryName(prefs: SharedPreferences, url: String, newName: String) {
         val current = prefs.getString(PREF_KEY, "") ?: return
         val updated = current.lines().map { line ->

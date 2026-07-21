@@ -3,7 +3,10 @@ package eu.kanade.tachiyomi.animeextension.all.googledrive
 import androidx.preference.EditTextPreference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
+import aniyomi.lib.filenameutils.FilenameUtils
 import aniyomi.lib.googledriveextractor.GoogleDriveExtractor
+import aniyomi.lib.googledrivescraper.FolderResult
+import aniyomi.lib.googledrivescraper.GoogleDriveScraper
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilter
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
@@ -13,24 +16,12 @@ import eu.kanade.tachiyomi.animesource.model.SEpisode
 import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.animesource.online.AnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
-import eu.kanade.tachiyomi.network.POST
-import eu.kanade.tachiyomi.util.asJsoup
-import keiyoushi.utils.commonEmptyRequestBody
 import keiyoushi.utils.getPreferencesLazy
-import keiyoushi.utils.parseAs
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
-import okhttp3.HttpUrl.Companion.toHttpUrl
-import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
-import okio.ProtocolException
-import org.jsoup.nodes.Document
 import uy.kohesive.injekt.injectLazy
-import java.security.MessageDigest
-import java.text.SimpleDateFormat
-import java.util.Locale
 
 class GoogleDrive :
     AnimeHttpSource(),
@@ -50,18 +41,13 @@ class GoogleDrive :
 
     private val preferences by getPreferencesLazy()
 
-    private val getHeaders = headers.newBuilder().apply {
-        add("Accept", "*/*")
-        add("Connection", "keep-alive")
-        add("Cookie", getCookie("https://drive.google.com"))
-        add("Host", "drive.google.com")
-    }.build()
-
-    private var nextPageToken: String? = ""
-
-    private val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
+    private val scraper by lazy { GoogleDriveScraper(client, headers) }
 
     private var cachedAnimes: List<SAnime>? = null
+
+    // Caché en memoria de detalles ya resueltos por entrada, para no repetir
+    // las llamadas de red de getAnimeDetails al reabrir la misma entrada.
+    private val detailsCache = mutableMapOf<String, SAnime>()
 
     // ============================== Popular ===============================
 
@@ -98,87 +84,69 @@ class GoogleDrive :
         val animeList = mutableListOf<SAnime>()
 
         entries.forEach { entry ->
-            val match = DRIVE_FOLDER_REGEX.matchEntire(entry.url) ?: return@forEach
-            val folderId = match.groups["id"]!!.value
-            val recurDepth = match.groups["depth"]?.value ?: ""
-            val folderUrl = "https://drive.google.com/drive/folders/$folderId$recurDepth"
-
-            val httpResponse = try {
-                client.newCall(GET(folderUrl, headers = getHeaders)).execute()
-            } catch (a: ProtocolException) {
-                return@forEach
-            }
-
-            if (httpResponse.code == 404) {
-                httpResponse.close()
+            val fileMatch = DRIVE_FILE_REGEX.matchEntire(entry.url)
+            if (fileMatch != null) {
+                val fileId = fileMatch.groups["id1"]?.value ?: fileMatch.groups["id2"]!!.value
                 animeList.add(
                     SAnime.create().apply {
-                        title = "❌ ${entry.name} (Carpeta eliminada)"
-                        thumbnail_url = "https://http.cat/404"
-                        url = LinkData(entry.url, "error404", LinkDataInfo(entry.name, entry.url)).toJsonString()
-                        status = SAnime.UNKNOWN
-                        description = "Esta carpeta fue eliminada o ya no está disponible.\n\nPara eliminarla, copia la línea de abajo y pégala en Ajustes → Eliminar enlace:\n\n${entry.name}::${entry.url}"
+                        title = entry.name
+                        url = LinkData(
+                            "https://drive.google.com/uc?id=$fileId",
+                            "single",
+                            LinkDataInfo(entry.name, ""),
+                        ).toJsonString()
+                        thumbnail_url = ""
                     },
                 )
                 return@forEach
             }
 
-            val driveDocument = httpResponse.asJsoup()
-
-            val hasKey = driveDocument.select("script").any { KEY_REGEX.find(it.data()) != null }
-            if (!hasKey) return@forEach
+            val match = DRIVE_FOLDER_REGEX.matchEntire(entry.url) ?: return@forEach
+            val folderId = match.groups["id"]!!.value
+            val recurDepth = match.groups["depth"]?.value ?: ""
+            val folderUrl = "https://drive.google.com/drive/folders/$folderId$recurDepth"
 
             var pageToken: String? = ""
-            var shouldBreak = false
-            while (pageToken != null && !shouldBreak) {
-                try {
-                    val response = client.newCall(
-                        createPost(driveDocument, folderId, pageToken),
-                    ).execute()
+            // Solo la primera página decide si la raíz es un solo anime
+            // (todo video, sin subcarpetas) o un catálogo de subcarpetas.
+            var firstPage = true
 
-                    val bodyText = response.body.string()
-                    val jsonText = JSON_REGEX.find(bodyText)?.groupValues?.get(1)
-                    if (jsonText == null) {
-                        shouldBreak = true
-                        return@forEach
-                    }
-
-                    val parsed = json.decodeFromString<PostResponse>(jsonText)
-
-                    if (parsed.items == null) {
-                        shouldBreak = true
-                        return@forEach
-                    }
-
-                    val folders = parsed.items.filter {
-                        it.mimeType.endsWith(".folder") ||
-                            (it.mimeType == "application/vnd.google-apps.shortcut" && it.shortcutDetails?.targetMimeType?.endsWith(".folder") == true)
-                    }
-                    val videos = parsed.items.filter {
-                        it.mimeType.startsWith("video") ||
-                            (it.mimeType == "application/vnd.google-apps.shortcut" && it.shortcutDetails?.targetMimeType?.startsWith("video") == true)
-                    }
-
-                    if (folders.isEmpty() && videos.isNotEmpty()) {
+            while (pageToken != null) {
+                when (val result = scraper.listFolderItemsResult(folderId, pageToken)) {
+                    is FolderResult.NotFound -> {
                         animeList.add(
                             SAnime.create().apply {
-                                title = entry.name
-                                url = LinkData(folderUrl, "multi").toJsonString()
-                                thumbnail_url = ""
+                                title = "❌ ${entry.name} (Carpeta eliminada)"
+                                thumbnail_url = "https://http.cat/404"
+                                url = LinkData(entry.url, "error404", LinkDataInfo(entry.name, entry.url)).toJsonString()
+                                status = SAnime.UNKNOWN
+                                description = "Esta carpeta fue eliminada o ya no está disponible.\n\n" + removeEntryHint(entry.name, entry.url)
                             },
                         )
-                    } else {
+                        return@forEach
+                    }
+                    FolderResult.NetworkError -> return@forEach
+                    is FolderResult.Success -> {
+                        val folders = result.page.items.filter { it.isFolder }
+                        val videos = result.page.items.filter { it.isVideo }
+
+                        if (firstPage && folders.isEmpty() && videos.isNotEmpty()) {
+                            animeList.add(
+                                SAnime.create().apply {
+                                    title = entry.name
+                                    url = LinkData(folderUrl, "multi").toJsonString()
+                                    thumbnail_url = ""
+                                },
+                            )
+                            return@forEach
+                        }
+
                         folders.forEach { item ->
-                            val itemId = if (item.mimeType == "application/vnd.google-apps.shortcut") {
-                                item.shortcutDetails?.targetId ?: item.id
-                            } else {
-                                item.id
-                            }
                             animeList.add(
                                 SAnime.create().apply {
                                     title = item.title
                                     url = LinkData(
-                                        "https://drive.google.com/drive/folders/$itemId$recurDepth",
+                                        "https://drive.google.com/drive/folders/${item.id}$recurDepth",
                                         "multi",
                                     ).toJsonString()
                                     thumbnail_url = ""
@@ -186,28 +154,22 @@ class GoogleDrive :
                             )
                         }
                         videos.forEach { item ->
-                            val itemId = if (item.mimeType == "application/vnd.google-apps.shortcut") {
-                                item.shortcutDetails?.targetId ?: item.id
-                            } else {
-                                item.id
-                            }
                             animeList.add(
                                 SAnime.create().apply {
                                     title = item.title
                                     url = LinkData(
-                                        "https://drive.google.com/uc?id=$itemId",
+                                        "https://drive.google.com/uc?id=${item.id}",
                                         "single",
-                                        LinkDataInfo(item.title, item.fileSize?.toLongOrNull()?.let { formatBytes(it) } ?: ""),
+                                        LinkDataInfo(item.title, item.fileSize?.let { formatBytes(it) } ?: ""),
                                     ).toJsonString()
                                     thumbnail_url = ""
                                 },
                             )
                         }
-                    }
 
-                    pageToken = parsed.nextPageToken
-                } catch (e: Exception) {
-                    shouldBreak = true
+                        pageToken = result.page.nextPageToken
+                        firstPage = false
+                    }
                 }
             }
         }
@@ -238,21 +200,48 @@ class GoogleDrive :
         val nameFilter = filterList.find { it is NameFilter } as NameFilter
 
         return if (urlFilter.state.isNotBlank()) {
-            val match = DRIVE_FOLDER_REGEX.matchEntire(urlFilter.state.trim())
-                ?: throw Exception("URL de Google Drive inválida")
+            val pastedUrl = urlFilter.state.trim()
+            val folderMatch = DRIVE_FOLDER_REGEX.matchEntire(pastedUrl)
 
-            val folderId = match.groups["id"]!!.value
-            val recurDepth = match.groups["depth"]?.value ?: ""
-            val folderUrl = "https://drive.google.com/drive/folders/$folderId$recurDepth"
+            if (folderMatch != null) {
+                val folderId = folderMatch.groups["id"]!!.value
+                val recurDepth = folderMatch.groups["depth"]?.value ?: ""
+                val folderUrl = "https://drive.google.com/drive/folders/$folderId$recurDepth"
 
-            val entryName = nameFilter.state.trim().takeIf { it.isNotBlank() }
-                ?: match.groups["name"]?.value?.substringAfter("[")?.substringBeforeLast("]")
-                ?: folderId
+                GoogleDrivePreferences.findByUrl(preferences, folderUrl)?.let { existing ->
+                    throw Exception("Este enlace ya está guardado como \"${existing.name}\"")
+                }
 
-            GoogleDrivePreferences.addEntry(preferences, entryName, folderUrl)
-            cachedAnimes = null
+                val entryName = nameFilter.state.trim().takeIf { it.isNotBlank() }
+                    ?: folderMatch.groups["name"]?.value?.substringAfter("[")?.substringBeforeLast("]")
+                    ?: folderId
 
-            addSinglePage(folderUrl)
+                GoogleDrivePreferences.addEntry(preferences, entryName, folderUrl)
+                cachedAnimes = null
+                detailsCache.clear()
+
+                addSinglePage(folderUrl)
+            } else {
+                val fileMatch = DRIVE_FILE_REGEX.matchEntire(pastedUrl)
+                    ?: throw Exception("URL de Google Drive inválida")
+
+                val fileId = fileMatch.groups["id1"]?.value ?: fileMatch.groups["id2"]!!.value
+                val fileUrl = "https://drive.google.com/uc?id=$fileId"
+
+                GoogleDrivePreferences.findByUrl(preferences, fileUrl)?.let { existing ->
+                    throw Exception("Este enlace ya está guardado como \"${existing.name}\"")
+                }
+
+                val entryName = nameFilter.state.trim().takeIf { it.isNotBlank() }
+                    ?: fileMatch.groups["name"]?.value?.substringAfter("[")?.substringBeforeLast("]")
+                    ?: fileId
+
+                GoogleDrivePreferences.addEntry(preferences, entryName, fileUrl)
+                cachedAnimes = null
+                detailsCache.clear()
+
+                addSinglePage(fileUrl, entryName, isFile = true)
+            }
         } else if (query.isNotBlank()) {
             val all = getPopularAnime(page)
             AnimesPage(all.animes.filter { it.title.contains(query, ignoreCase = true) }, false)
@@ -264,12 +253,12 @@ class GoogleDrive :
     // ============================== FILTERS ===============================
 
     override fun getFilterList(): AnimeFilterList = AnimeFilterList(
-        AnimeFilter.Header("Agregar carpeta de Google Drive"),
+        AnimeFilter.Header("Agregar carpeta o archivo de Google Drive"),
         URLFilter(),
         NameFilter(),
     )
 
-    private class URLFilter : AnimeFilter.Text("URL de carpeta")
+    private class URLFilter : AnimeFilter.Text("URL de carpeta o archivo")
 
     private class NameFilter : AnimeFilter.Text("Nombre (opcional)")
 
@@ -279,10 +268,10 @@ class GoogleDrive :
         val parsed = try {
             json.decodeFromString<LinkData>(anime.url)
         } catch (e: Exception) {
-            return GET(baseUrl, headers = getHeaders)
+            return GET(baseUrl, headers = headers)
         }
-        if (parsed.type == "error404") return GET(baseUrl, headers = getHeaders)
-        return GET(parsed.url, headers = getHeaders)
+        if (parsed.type == "error404") return GET(baseUrl, headers = headers)
+        return GET(parsed.url, headers = headers)
     }
 
     override suspend fun getAnimeDetails(anime: SAnime): SAnime {
@@ -292,90 +281,96 @@ class GoogleDrive :
             return anime
         }
 
-        // FIX: entrada de error 404 — devolver tal cual para preservar la descripcion
         if (parsed.type == "error404") return anime
 
-        if (parsed.type == "single") return anime
-
-        val folderId = DRIVE_FOLDER_REGEX.matchEntire(parsed.url)!!.groups["id"]!!.value
-
-        val driveDocument = try {
-            client.newCall(GET(parsed.url, headers = getHeaders)).execute().asJsoup()
-        } catch (a: ProtocolException) {
-            null
-        } ?: return anime
-
-        // Get cover
-        val coverResponse = client.newCall(
-            createPost(driveDocument, folderId, nextPageToken, searchReqWithType(folderId, "cover", IMAGE_MIMETYPE)),
-        ).execute().parseAs<PostResponse> { JSON_REGEX.find(it)!!.groupValues[1] }
-
-        coverResponse.items?.firstOrNull()?.let {
-            anime.thumbnail_url = "https://drive.google.com/uc?id=${it.id}"
+        // Un archivo suelto no tiene carpeta que recorrer ni details.json/cover que buscar.
+        if (parsed.type == "single") {
+            return anime.apply { description = removeEntryHint(anime.title, parsed.url) }
         }
 
-        // Get details
-        val detailsResponse = client.newCall(
-            createPost(driveDocument, folderId, nextPageToken, searchReqWithType(folderId, "details.json", "")),
-        ).execute().parseAs<PostResponse> { JSON_REGEX.find(it)!!.groupValues[1] }
+        // anime.url completa como key: dos entradas pueden apuntar al mismo
+        // folderId (mismo link agregado dos veces con nombres distintos).
+        val cacheKey = anime.url
 
-        detailsResponse.items?.firstOrNull()?.let {
-            val newPostHeaders = getHeaders.newBuilder().apply {
-                add("Content-Type", "application/x-www-form-urlencoded;charset=utf-8")
-                set("Host", "drive.usercontent.google.com")
-                add("Origin", "https://drive.google.com")
-                add("Referer", "https://drive.google.com/")
-                add("X-Drive-First-Party", "DriveWebUi")
-                add("X-Json-Requested", "true")
-            }.build()
-
-            val newPostUrl = "https://drive.usercontent.google.com/uc?id=${it.id}&authuser=0&export=download"
-
-            val newResponse = client.newCall(
-                POST(newPostUrl, headers = newPostHeaders, body = commonEmptyRequestBody),
-            ).execute().parseAs<DownloadResponse> { JSON_REGEX.find(it)!!.groupValues[1] }
-
-            val downloadHeaders = headers.newBuilder().apply {
-                add("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
-                add("Connection", "keep-alive")
-                add("Cookie", getCookie("https://drive.usercontent.google.com"))
-                add("Host", "drive.usercontent.google.com")
-            }.build()
-
-            client.newCall(
-                GET(newResponse.downloadUrl, headers = downloadHeaders),
-            ).execute().parseAs<DetailsJson>().let { t ->
-                t.title?.let { anime.title = it }
-                t.author?.let { anime.author = it }
-                t.artist?.let { anime.artist = it }
-                t.description?.let { anime.description = it }
-                t.genre?.let { anime.genre = it.joinToString(", ") }
-                t.status?.let { anime.status = it.toIntOrNull() ?: SAnime.UNKNOWN }
+        detailsCache[cacheKey]?.let { cached ->
+            return anime.apply {
+                thumbnail_url = cached.thumbnail_url
+                author = cached.author
+                artist = cached.artist
+                description = cached.description
+                genre = cached.genre
+                status = cached.status
             }
+        }
+
+        // El nombre lo elige el usuario al guardar el enlace y nunca lo
+        // sobrescribe details.json (que puede traer algo genérico como "Folder").
+        val originalName = anime.title
+
+        val details = scraper.scrapeFolderDetails(parsed.url)
+            ?: return anime.apply { description = removeEntryHint(originalName, parsed.url) }
+
+        details.coverUrl?.let { anime.thumbnail_url = it }
+        details.author?.let { anime.author = it }
+        details.artist?.let { anime.artist = it }
+        details.genre?.let { anime.genre = it }
+        details.status?.let { anime.status = it.toIntOrNull() ?: SAnime.UNKNOWN }
+
+        // Se reconstruye desde details.description, no desde anime.description:
+        // Aniyomi/Anikku persiste ese campo entre sesiones y puede traer un hint
+        // ya escrito de una carga anterior, acumulándose en cada carga.
+        anime.description = (details.description?.takeIf { it.isNotBlank() }?.let { "$it\n\n" } ?: "") +
+            removeEntryHint(originalName, parsed.url)
+
+        // Copia de los valores, no la referencia mutable de "anime".
+        detailsCache[cacheKey] = SAnime.create().apply {
+            thumbnail_url = anime.thumbnail_url
+            author = anime.author
+            artist = anime.artist
+            description = anime.description
+            genre = anime.genre
+            status = anime.status
         }
 
         return anime
     }
+
+    /**
+     * Texto reutilizado en la descripción de cada entrada para poder
+     * eliminarla desde Ajustes → Eliminar enlace (pegando el nombre o la
+     * URL) sin tener que buscarla a mano en "Enlaces guardados".
+     */
+    private fun removeEntryHint(entryName: String, entryUrl: String): String = "Para eliminar este enlace, copia el nombre (\"$entryName\") o la URL de abajo " +
+        "y pégala en Ajustes → Eliminar enlace:\n\n$entryUrl"
 
     override fun animeDetailsParse(response: Response): SAnime = throw UnsupportedOperationException()
 
     // ============================== Episodes ==============================
 
     override suspend fun getEpisodeList(anime: SAnime): List<SEpisode> {
-        val episodeList = mutableListOf<SEpisode>()
         val parsed = json.decodeFromString<LinkData>(anime.url)
 
-        // FIX: entrada de error 404 — sin episodios
         if (parsed.type == "error404") return emptyList()
 
         if (parsed.type == "single") {
+            val fileId = parsed.url.substringAfter("id=")
+            val metadata = scraper.fetchFileMetadata(fileId)
+
+            val size = metadata?.fileSize?.let { formatBytes(it) } ?: ""
+
+            // Mismo criterio que las carpetas: nombre real o "Episodio N" según showFilename.
+            val display = FilenameUtils.buildEpisodeDisplay(
+                metadata?.title ?: "Video",
+                GoogleDrivePreferences.showFilename(preferences),
+            )
+
             return listOf(
                 SEpisode.create().apply {
-                    name = "Video"
-                    scanlator = parsed.info!!.size
+                    name = display.name
+                    scanlator = size
                     url = parsed.url
-                    episode_number = 1F
-                    date_upload = -1L
+                    episode_number = display.episodeNumber
+                    date_upload = metadata?.modifiedDateMillis ?: -1L
                 },
             )
         }
@@ -388,100 +383,24 @@ class GoogleDrive :
             it.value.substringAfter(",").split(",").map { it.toInt() }
         } ?: listOf(null, null)
 
-        fun traverseFolder(folderUrl: String, path: String, recursionDepth: Int = 0) {
-            if (recursionDepth == maxRecursionDepth) return
+        val scraped = scraper.scrapeEpisodes(parsed.url, maxRecursionDepth, start, stop)
+        val showFilename = GoogleDrivePreferences.showFilename(preferences)
 
-            val folderId = DRIVE_FOLDER_REGEX.matchEntire(folderUrl)!!.groups["id"]!!.value
-
-            val driveDocument = try {
-                client.newCall(GET(folderUrl, headers = getHeaders)).execute().asJsoup()
-            } catch (a: ProtocolException) {
-                throw Exception("Unable to get items, check webview")
-            }
-
-            if (driveDocument.selectFirst("title:contains(Error 404 \\(Not found\\))") != null) return
-
-            var pageToken: String? = ""
-            var counter = 1
-
-            while (pageToken != null) {
-                val response = client.newCall(
-                    createPost(driveDocument, folderId, pageToken),
-                ).execute()
-
-                val parsed = response.parseAs<PostResponse> {
-                    JSON_REGEX.find(it)!!.groupValues[1]
-                }
-
-                if (parsed.items == null) throw Exception("Failed to load items, please log in through webview")
-
-                parsed.items.forEachIndexed { index, it ->
-                    val isVideo = it.mimeType.startsWith("video") ||
-                        (it.mimeType == "application/vnd.google-apps.shortcut" && it.shortcutDetails?.targetMimeType?.startsWith("video") == true)
-                    val itemId = if (it.mimeType == "application/vnd.google-apps.shortcut") {
-                        it.shortcutDetails?.targetId ?: it.id
-                    } else {
-                        it.id
-                    }
-
-                    if (isVideo) {
-                        val size = it.fileSize?.toLongOrNull()?.let { formatBytes(it) } ?: ""
-                        val pathName = path
-
-                        if (start != null && maxRecursionDepth == 1 && counter < start) {
-                            counter++
-                            return@forEachIndexed
-                        }
-                        if (stop != null && maxRecursionDepth == 1 && counter > stop) return
-
-                        val epNumber = (index + 1).toFloat()
-                        episodeList.add(
-                            SEpisode.create().apply {
-                                name = if (GoogleDrivePreferences.showFilename(preferences)) {
-                                    it.title
-                                } else {
-                                    "Episodio $counter"
-                                }
-                                url = "https://drive.google.com/uc?id=$itemId"
-                                episode_number = ITEM_NUMBER_REGEX.find(it.title)?.groupValues?.get(1)
-                                    ?.toFloatOrNull() ?: epNumber
-                                date_upload = it.modifiedDate?.let { date ->
-                                    runCatching { dateFormat.parse(date)?.time }.getOrNull()
-                                } ?: -1L
-                                scanlator = if (pathName.isBlank()) {
-                                    size.takeIf { it.isNotBlank() } ?: ""
-                                } else {
-                                    if (size.isNotBlank()) "/$pathName • $size" else "/$pathName"
-                                }
-                            },
-                        )
-                        counter++
-                    }
-
-                    val isFolder = it.mimeType.endsWith(".folder") ||
-                        (it.mimeType == "application/vnd.google-apps.shortcut" && it.shortcutDetails?.targetMimeType?.endsWith(".folder") == true)
-                    val itemFolderId = if (it.mimeType == "application/vnd.google-apps.shortcut") {
-                        it.shortcutDetails?.targetId ?: it.id
-                    } else {
-                        it.id
-                    }
-
-                    if (isFolder) {
-                        traverseFolder(
-                            "https://drive.google.com/drive/folders/$itemFolderId",
-                            if (path.isEmpty()) it.title else "$path/${it.title}",
-                            recursionDepth + 1,
-                        )
-                    }
-                }
-
-                pageToken = parsed.nextPageToken
-            }
+        // El rango start/stop ya se aplicó dentro de scrapeEpisodes, por posición original.
+        val episodeList = scraped.map { ep ->
+            val display = FilenameUtils.buildEpisodeDisplay(ep.name, showFilename)
+            SEpisode.create().apply {
+                name = display.name
+                url = ep.url
+                episode_number = display.episodeNumber
+                date_upload = ep.dateUploadMillis
+                scanlator = ep.sizeLabel
+            } to ep.name
         }
 
-        traverseFolder(parsed.url, "")
-
-        return episodeList.reversed()
+        // Especiales (OP, ED, OVA...) arriba, luego episodios de mayor a menor.
+        return FilenameUtils.sortByEpisodeNumberDescending(episodeList) { it.second }
+            .map { it.first }
     }
 
     override fun episodeListParse(response: Response): List<SEpisode> = throw UnsupportedOperationException()
@@ -492,170 +411,32 @@ class GoogleDrive :
 
     // ============================= Utilities ==============================
 
-    private fun addSinglePage(folderUrl: String): AnimesPage {
-        val match = DRIVE_FOLDER_REGEX.matchEntire(folderUrl) ?: throw Exception("Invalid drive url")
-        val recurDepth = match.groups["depth"]?.value ?: ""
+    private fun addSinglePage(url: String, entryName: String? = null, isFile: Boolean = false): AnimesPage {
+        val anime = if (isFile) {
+            SAnime.create().apply {
+                title = entryName ?: "Archivo"
+                this.url = LinkData(
+                    url,
+                    "single",
+                    LinkDataInfo(entryName ?: "Archivo", ""),
+                ).toJsonString()
+                thumbnail_url = ""
+            }
+        } else {
+            val match = DRIVE_FOLDER_REGEX.matchEntire(url) ?: throw Exception("URL de Google Drive inválida")
+            val recurDepth = match.groups["depth"]?.value ?: ""
 
-        val anime = SAnime.create().apply {
-            title = match.groups["name"]?.value?.substringAfter("[")?.substringBeforeLast("]")
-                ?: "Folder"
-            url = LinkData(
-                "https://drive.google.com/drive/folders/${match.groups["id"]!!.value}$recurDepth",
-                "multi",
-            ).toJsonString()
-            thumbnail_url = ""
+            SAnime.create().apply {
+                title = entryName ?: match.groups["name"]?.value?.substringAfter("[")?.substringBeforeLast("]")
+                    ?: "Folder"
+                this.url = LinkData(
+                    "https://drive.google.com/drive/folders/${match.groups["id"]!!.value}$recurDepth",
+                    "multi",
+                ).toJsonString()
+                thumbnail_url = ""
+            }
         }
         return AnimesPage(listOf(anime), false)
-    }
-
-    private fun createPost(
-        document: Document,
-        folderId: String,
-        pageToken: String?,
-        getMultiFormPath: (String, String, String) -> String = { folderIdStr, nextPageTokenStr, keyStr ->
-            defaultGetRequest(folderIdStr, nextPageTokenStr, keyStr)
-        },
-    ): Request {
-        val keyScript = document.select("script").firstOrNull { script ->
-            KEY_REGEX.find(script.data()) != null
-        }?.data() ?: ""
-        val key = KEY_REGEX.find(keyScript)?.groupValues?.get(1) ?: ""
-
-        val versionScript = document.select("script").firstOrNull { script ->
-            VERSION_REGEX.find(script.data()) != null
-        }?.data() ?: ""
-        val driveVersion = VERSION_REGEX.find(versionScript)?.groupValues?.get(1) ?: ""
-
-        val sapisid =
-            client.cookieJar.loadForRequest("https://drive.google.com".toHttpUrl()).firstOrNull {
-                it.name == "SAPISID" || it.name == "__Secure-3PAPISID"
-            }?.value ?: ""
-
-        val requestUrl = getMultiFormPath(folderId, pageToken ?: "", key)
-        val body = """--$BOUNDARY
-                    |content-type: application/http
-                    |content-transfer-encoding: binary
-                    |
-                    |GET $requestUrl
-                    |X-Goog-Drive-Client-Version: $driveVersion
-                    |authorization: ${generateSapisidhashHeader(sapisid)}
-                    |x-goog-authuser: 0
-                    |
-                    |--$BOUNDARY--""".trimMargin("|")
-            .toRequestBody("multipart/mixed; boundary=\"$BOUNDARY\"".toMediaType())
-
-        val postUrl = buildString {
-            append("https://clients6.google.com/batch/drive/v2internal")
-            append("?${'$'}ct=multipart/mixed; boundary=\"$BOUNDARY\"")
-            append("&key=$key")
-        }
-
-        val postHeaders = headers.newBuilder().apply {
-            add("Content-Type", "text/plain; charset=UTF-8")
-            add("Origin", "https://drive.google.com")
-            add("Cookie", getCookie("https://drive.google.com"))
-        }.build()
-
-        return POST(postUrl, body = body, headers = postHeaders)
-    }
-
-    private fun parsePage(
-        request: Request,
-        page: Int,
-        genMultiFormReq: ((String, String, String) -> String)? = null,
-    ): AnimesPage {
-        val animeList = mutableListOf<SAnime>()
-
-        val recurDepth = request.url.encodedFragment?.let { "#$it" } ?: ""
-
-        val folderId = DRIVE_FOLDER_REGEX.matchEntire(request.url.toString())!!.groups["id"]!!.value
-
-        val driveDocument = try {
-            client.newCall(request).execute().asJsoup()
-        } catch (a: ProtocolException) {
-            throw Exception("Unable to get items, check webview")
-        }
-
-        if (driveDocument.selectFirst("title:contains(Error 404 \\(Not found\\))") != null) {
-            return AnimesPage(emptyList(), false)
-        }
-
-        if (page == 1) nextPageToken = ""
-        val post = if (genMultiFormReq == null) {
-            createPost(driveDocument, folderId, nextPageToken)
-        } else {
-            createPost(driveDocument, folderId, nextPageToken, genMultiFormReq)
-        }
-        val response = client.newCall(post).execute()
-
-        val parsed = response.parseAs<PostResponse> {
-            JSON_REGEX.find(it)!!.groupValues[1]
-        }
-
-        if (parsed.items == null) throw Exception("Failed to load items, please log in through webview")
-        parsed.items.forEachIndexed { index, it ->
-            val isVideo = it.mimeType.startsWith("video") ||
-                (it.mimeType == "application/vnd.google-apps.shortcut" && it.shortcutDetails?.targetMimeType?.startsWith("video") == true)
-            val itemId = if (it.mimeType == "application/vnd.google-apps.shortcut") {
-                it.shortcutDetails?.targetId ?: it.id
-            } else {
-                it.id
-            }
-
-            if (isVideo) {
-                animeList.add(
-                    SAnime.create().apply {
-                        title = it.title
-                        url = LinkData(
-                            "https://drive.google.com/uc?id=$itemId",
-                            "single",
-                            LinkDataInfo(
-                                it.title,
-                                it.fileSize?.toLongOrNull()?.let { formatBytes(it) } ?: "",
-                            ),
-                        ).toJsonString()
-                        thumbnail_url = ""
-                    },
-                )
-            }
-
-            val isFolder = it.mimeType.endsWith(".folder") ||
-                (it.mimeType == "application/vnd.google-apps.shortcut" && it.shortcutDetails?.targetMimeType?.endsWith(".folder") == true)
-            val itemFolderId = if (it.mimeType == "application/vnd.google-apps.shortcut") {
-                it.shortcutDetails?.targetId ?: it.id
-            } else {
-                it.id
-            }
-
-            if (isFolder) {
-                animeList.add(
-                    SAnime.create().apply {
-                        title = it.title
-                        url = LinkData(
-                            "https://drive.google.com/drive/folders/$itemFolderId$recurDepth",
-                            "multi",
-                        ).toJsonString()
-                        thumbnail_url = ""
-                    },
-                )
-            }
-        }
-
-        nextPageToken = parsed.nextPageToken
-
-        return AnimesPage(animeList, nextPageToken != null)
-    }
-
-    private fun generateSapisidhashHeader(
-        SAPISID: String,
-        origin: String = "https://drive.google.com",
-    ): String {
-        val timeNow = System.currentTimeMillis() / 1000
-        val sapisidhash = MessageDigest
-            .getInstance("SHA-1")
-            .digest("$timeNow $SAPISID $origin".toByteArray())
-            .joinToString("") { "%02x".format(it) }
-        return "SAPISIDHASH ${timeNow}_$sapisidhash"
     }
 
     private fun formatBytes(bytes: Long): String = when {
@@ -667,26 +448,17 @@ class GoogleDrive :
         else -> ""
     }
 
-    private fun getCookie(url: String): String {
-        val cookieList = client.cookieJar.loadForRequest(url.toHttpUrl())
-        return if (cookieList.isNotEmpty()) {
-            cookieList.joinToString("; ") { "${it.name}=${it.value}" }
-        } else {
-            ""
-        }
-    }
-
     private fun LinkData.toJsonString(): String = json.encodeToString(this)
 
     companion object {
         private val DRIVE_FOLDER_REGEX = Regex(
             """(?<name>\[[^\[\];]+\])?https?:\/\/(?:docs|drive)\.google\.com\/drive(?:\/[^\/]+)*?\/folders\/(?<id>[\w-]{28,})(?:\?[^;#]+)?(?<depth>#\d+(?<range>,\d+,\d+)?)?${'$'}""",
         )
-        private val KEY_REGEX = Regex(""""(\w{39})"""")
-        private val VERSION_REGEX = Regex(""""([^"]+web-frontend[^"]+)"""")
-        private val JSON_REGEX = Regex("""(?:)\s*(\{(.+)\})\s*(?:)""", RegexOption.DOT_MATCHES_ALL)
-        private const val BOUNDARY = "=====vc17a3rwnndj====="
-        private val ITEM_NUMBER_REGEX = Regex(""" - (?:S\d+E)?(\d+)\b""")
+
+        // Ej.: .../file/d/<id>/view?usp=sharing o .../uc?id=<id>
+        private val DRIVE_FILE_REGEX = Regex(
+            """(?<name>\[[^\[\];]+\])?https?:\/\/(?:docs|drive)\.google\.com\/(?:file\/d\/(?<id1>[\w-]{25,})(?:\/[^?]*)?|uc\?(?:[^&]*&)*id=(?<id2>[\w-]{25,}))(?:[?&][^;]*)?${'$'}""",
+        )
     }
 
     // ============================== Settings ==============================
@@ -703,47 +475,48 @@ class GoogleDrive :
         }.also(screen::addPreference)
 
         val folderListPref = EditTextPreference(screen.context).apply {
-            key = "googledrive_folder_list"
+            key = GoogleDrivePreferences.PREF_KEY
             title = "Enlaces guardados"
             summary = "Toca para editar tus enlaces guardados"
             dialogTitle = "Enlaces guardados"
-            setDialogMessage("Una entrada por línea.\n\nEjemplo:\nNombre::URL de Google Drive\n\nPara eliminar una entrada, borra la línea completa.\n\nPara ver los cambios reflejados en el catálogo, cierra y vuelve a abrir la extensión.")
+            setDialogMessage(
+                "Una entrada por línea.\n\nEjemplo:\nNombre::URL de Google Drive\n\n" +
+                    "Para eliminar una entrada, borra la línea completa.\n\n" +
+                    "Para ver los cambios reflejados en el catálogo, cierra y vuelve a abrir la extensión.",
+            )
             setDefaultValue("")
             setOnPreferenceChangeListener { _, _ ->
                 cachedAnimes = null
+                detailsCache.clear()
                 true
             }
         }.also(screen::addPreference)
 
-        // FIX: campo para eliminar un enlace fácilmente
         lateinit var removeEntryPref: EditTextPreference
         removeEntryPref = EditTextPreference(screen.context).apply {
-            key = "googledrive_remove_entry"
+            key = GoogleDrivePreferences.REMOVE_ENTRY_KEY
             title = "Eliminar enlace"
-            summary = "Pega aquí la línea Nombre::URL que aparece en la descripción de la carpeta eliminada"
+            summary = "Pega aquí el nombre o el link de Google Drive del enlace que quieres quitar"
             dialogTitle = "Eliminar enlace"
-            setDialogMessage("Copia la línea Nombre::URL desde la descripción de la entrada con error y pégala aquí para eliminarla de tus enlaces guardados.\n\nPara ver los cambios reflejados en el catálogo, cierra y vuelve a abrir la extensión.")
+            setDialogMessage(
+                "Pega el nombre o la URL de Google Drive de la entrada que quieres quitar (puedes copiarlos desde " +
+                    "la descripción de esa entrada en el catálogo).\n\n" +
+                    "Si el nombre pegado coincide con más de una entrada guardada, no se elimina ninguna " +
+                    "(usa la URL en ese caso, para no borrar la equivocada).\n\n" +
+                    "Para ver los cambios reflejados en el catálogo, cierra y vuelve a abrir la extensión.",
+            )
             setDefaultValue("")
-            setOnPreferenceChangeListener { preference, newValue ->
+            setOnPreferenceChangeListener { _, newValue ->
                 val lineToRemove = (newValue as String).trim()
                 if (lineToRemove.isNotBlank()) {
-                    val current = preferences.getString("googledrive_folder_list", "") ?: ""
-                    val updated = current.lines()
-                        .filter { it.trim() != lineToRemove }
-                        .joinToString("\n")
-                    preferences.edit().putString("googledrive_folder_list", updated).apply()
+                    val updated = GoogleDrivePreferences.removeEntryByLine(preferences, lineToRemove)
                     cachedAnimes = null
-
-                    // FIX: actualizar también el EditTextPreference de "Enlaces guardados" para que refleje el cambio
+                    detailsCache.clear()
                     folderListPref.text = updated
 
-                    // FIX: limpiar el campo de "Eliminar enlace" tanto en preferences como en el objeto en pantalla,
-                    // usando post() para que se aplique después de que termine el ciclo actual del diálogo
-                    preferences.edit().putString("googledrive_remove_entry", "").commit()
-                    screen.context.let {
-                        android.os.Handler(android.os.Looper.getMainLooper()).post {
-                            removeEntryPref.text = ""
-                        }
+                    preferences.edit().putString(GoogleDrivePreferences.REMOVE_ENTRY_KEY, "").commit()
+                    android.os.Handler(android.os.Looper.getMainLooper()).post {
+                        removeEntryPref.text = ""
                     }
                 }
                 true
