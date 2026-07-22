@@ -91,10 +91,7 @@ class GoogleDriveScraper(private val client: OkHttpClient, private val headers: 
         val doc = client.newCall(
             GET("https://drive.google.com/file/d/$fileId/view", headers = driveHeaders),
         ).execute().asJsoup()
-        doc.selectFirst("title")?.text()
-            ?.removeSuffix(" - Google Drive")
-            ?.trim()
-            ?.takeIf { it.isNotBlank() }
+        fileNameFromDocument(doc)
     } catch (e: Exception) {
         null
     }
@@ -102,39 +99,72 @@ class GoogleDriveScraper(private val client: OkHttpClient, private val headers: 
     /**
      * Metadatos completos (nombre, tamaño, fecha de modificación) de un
      * archivo suelto de Drive por su ID, sin necesitar la carpeta que lo
-     * contiene. Requiere autenticación (SAPISIDHASH) -- si solo hace falta
-     * el nombre, [fetchFileName] es más liviana.
+     * contiene. Si solo hace falta el nombre, [fetchFileName] es más
+     * liviana y no requiere autenticación.
+     *
+     * ESTADO ACTUAL (sin resolver): la vía autenticada de abajo (key +
+     * SAPISIDHASH + batch API, con fallback a la key de `/drive/my-drive`)
+     * no está confirmada -- en pruebas reales el tamaño y la fecha
+     * siguieron llegando vacíos incluso con sesión iniciada. Por eso esta
+     * función cae directo al nombre real (vía [fetchFileName], que sí está
+     * confirmado que funciona) sin insistir con la parte autenticada. El
+     * código de la vía autenticada se deja tal cual para retomarlo más
+     * adelante -- ver notas al final de este archivo.
      */
-    fun fetchFileMetadata(fileId: String): FileMetadata? {
+    fun fetchFileMetadata(fileId: String): FileMetadata? = fetchFileName(fileId)?.let { FileMetadata(it, null, null) }
+
+    /**
+     * Vía autenticada para [fetchFileMetadata], actualmente sin usar -- ver
+     * el docblock de esa función para el motivo. Se deja implementada para
+     * retomarla más adelante en vez de perder el trabajo ya hecho.
+     */
+    @Suppress("unused")
+    private fun fetchFileMetadataAuthenticated(fileId: String): FileMetadata? {
         val fileDocument = try {
             client.newCall(
                 GET("https://drive.google.com/file/d/$fileId/view", headers = driveHeaders),
             ).execute().asJsoup()
         } catch (a: ProtocolException) {
-            return null
+            return fetchFileName(fileId)?.let { FileMetadata(it, null, null) }
         }
 
-        val key = extractKey(fileDocument) ?: return null
+        val fallbackName = fileNameFromDocument(fileDocument)
+
+        val myDriveDocument by lazy { fetchMyDriveDocument() }
+        val keySourceDocument = if (extractKey(fileDocument) != null) fileDocument else myDriveDocument
+        val key = keySourceDocument?.let { extractKey(it) }
+        if (key == null || keySourceDocument == null) {
+            return fallbackName?.let { FileMetadata(it, null, null) }
+        }
 
         val response = try {
             client.newCall(
-                createBatchPost(fileDocument, singleFileMetadataReq(fileId, key), keyOverride = key),
+                createBatchPost(keySourceDocument, singleFileMetadataReq(fileId, key), keyOverride = key),
             ).execute()
         } catch (e: Exception) {
-            return null
+            return fallbackName?.let { FileMetadata(it, null, null) }
         }
 
         val parsed = try {
             response.parseAs<SingleFileResponse> { JSON_REGEX.find(it)!!.groupValues[1] }
         } catch (e: Exception) {
-            return null
+            return fallbackName?.let { FileMetadata(it, null, null) }
         }
 
         return FileMetadata(
             title = parsed.title,
-            fileSize = parsed.fileSize?.toLongOrNull(),
+            fileSize = parsed.fileSize?.toLongOrNull() ?: parsed.quotaBytesUsed?.toLongOrNull(),
             modifiedDateMillis = parsed.modifiedDate?.let { date -> runCatching { dateFormat.parse(date)?.time }.getOrNull() },
         )
+    }
+
+    /** Página raíz de Drive, usada como fuente alterna del key de la API cuando la del archivo/carpeta no lo trae. */
+    private fun fetchMyDriveDocument(): Document? = try {
+        client.newCall(
+            GET("https://drive.google.com/drive/my-drive", headers = driveHeaders),
+        ).execute().asJsoup()
+    } catch (e: Exception) {
+        null
     }
 
     // ============================ Alto nivel ================================
@@ -300,6 +330,11 @@ class GoogleDriveScraper(private val client: OkHttpClient, private val headers: 
         return DocumentResult.Success(response.asJsoup())
     }
 
+    private fun fileNameFromDocument(document: Document): String? = document.selectFirst("title")?.text()
+        ?.removeSuffix(" - Google Drive")
+        ?.trim()
+        ?.takeIf { it.isNotBlank() }
+
     private fun fetchFolderDocument(folderId: String): Document? = (fetchFolderDocumentResult(folderId) as? DocumentResult.Success)?.document
 
     private fun extractKey(document: Document): String? {
@@ -408,3 +443,40 @@ class GoogleDriveScraper(private val client: OkHttpClient, private val headers: 
         private const val BOUNDARY = "=====vc17a3rwnndj====="
     }
 }
+
+/*
+ * NOTA PENDIENTE: tamaño y fecha para archivos sueltos (fetchFileMetadata)
+ *
+ * Estado actual: fetchFileMetadata solo resuelve el nombre real (vía
+ * fetchFileName, confirmado que funciona). Tamaño y fecha quedan vacíos
+ * para un archivo agregado directo (a diferencia de un archivo encontrado
+ * dentro de una carpeta, donde sí llegan bien vía listFolderItems).
+ *
+ * Ya probado y descartado (o no confirmado) en esta sesión:
+ * - extractKey sobre el documento de /file/d/<id>/view: la página del
+ *   archivo suelto no siempre trae el script con la key de 39 caracteres
+ *   que sí trae la página de una carpeta.
+ * - Fallback a extraer esa key desde /drive/my-drive (con sesión iniciada
+ *   vía WebView): implementado en fetchFileMetadataAuthenticated, pero en
+ *   pruebas reales tamaño y fecha siguieron sin llegar.
+ * - Fallback de fileSize a quotaBytesUsed (espacio en la cuota del
+ *   usuario) en la respuesta de la API: agregado al DTO y a la query, pero
+ *   no se pudo confirmar si realmente resuelve el problema, porque la
+ *   petición autenticada en sí parece no estar completando bien antes de
+ *   llegar a ese punto.
+ *
+ * Sin confirmar cuál es el punto exacto de falla -- no se agregaron logs
+ * para diagnosticarlo en esta sesión. Cosas a testear en una próxima:
+ * - Loggear si extractKey(fileDocument) y extractKey(myDriveDocument)
+ *   devuelven algo o null, para saber si el problema es no encontrar la
+ *   key en ninguna de las dos páginas.
+ * - Si sí hay key, loggear el código de respuesta y el body crudo de la
+ *   petición batch (createBatchPost) para ver si Drive responde con error
+ *   o con un JSON que simplemente no trae fileSize/quotaBytesUsed.
+ * - Probar /drive/shared-with-me como tercera fuente de key (mismo
+ *   mecanismo que /drive/my-drive, sin confirmar si cambia algo).
+ * - Alternativa de menor esfuerzo: usar la fecha de la entrada guardada
+ *   por el usuario (o de la carpeta padre si existe) como esta la usa
+ *   CollectedNotes con la fecha de la nota del sitio, en vez de perseguir
+ *   la fecha real de Drive para archivos sueltos.
+ */

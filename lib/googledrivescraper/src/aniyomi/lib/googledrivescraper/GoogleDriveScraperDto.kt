@@ -38,6 +38,7 @@ internal data class SingleFileResponse(
     val title: String,
     val mimeType: String,
     val fileSize: String? = null,
+    val quotaBytesUsed: String? = null,
     val modifiedDate: String? = null,
 )
 
