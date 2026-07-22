@@ -1,6 +1,9 @@
 package eu.kanade.tachiyomi.animeextension.es.wingzeroplus
 
+import androidx.preference.PreferenceScreen
+import aniyomi.lib.filenameutils.FilenameUtils
 import aniyomi.lib.googledriveextractor.GoogleDriveExtractor
+import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilter
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.AnimesPage
@@ -10,6 +13,8 @@ import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.animesource.online.ParsedAnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.util.asJsoup
+import keiyoushi.utils.addSwitchPreference
+import keiyoushi.utils.getPreferencesLazy
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -22,7 +27,9 @@ import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.io.IOException
 
-class WingZeroPlus : ParsedAnimeHttpSource() {
+class WingZeroPlus :
+    ParsedAnimeHttpSource(),
+    ConfigurableAnimeSource {
 
     override val name = "Wing Zero Plus"
     override val baseUrl = "https://plus.wing-zero-network.org"
@@ -31,43 +38,37 @@ class WingZeroPlus : ParsedAnimeHttpSource() {
 
     private val gdExtractor by lazy { GoogleDriveExtractor(client, headers) }
 
+    private val preferences by getPreferencesLazy()
+
+    private val showFilename: Boolean
+        get() = WingZeroPlusPreferences.showFilename(preferences)
+
     // ============================== Popular ===============================
 
-    // Por defecto mostramos Series en "popular". El filtro de Tipo permite cambiar a Películas
-    // desde la búsqueda (Aniyomi aplica los filtros incluso sin texto de búsqueda).
-    private var contentType = "series"
-
-    // El sitio pagina "series" del más antiguo (página 1) al más reciente (última página).
-    // Para mostrar lo más nuevo primero necesitamos saber cuántas páginas hay en total y
-    // pedirlas en orden inverso. Cacheamos el total una vez conocido para no recalcularlo
-    // en cada página (se resetea si el sitio cambia entre sesiones de la app).
+    // El sitio pagina "series" de más antiguo a más reciente. Para mostrar lo más
+    // nuevo primero, pedimos el total de páginas una vez y navegamos en reversa.
+    // Se cachea porque no cambia dentro de la misma sesión de la extensión.
     private var popularTotalPages: Int? = null
 
-    // Cachea en memoria la lista de animes ya parseada de cada página REAL del sitio
-    // (clave = número de página real, ya invertida). Así, si el usuario hace scroll hacia
-    // arriba y abajo dentro de la misma sesión, no se repite la petición HTTP a una página
-    // que ya se descargó antes. Se pierde si la extensión se recarga (nueva instancia).
+    // Cachea cada página real ya parseada (clave = número de página real) para no
+    // repetir la petición HTTP si el usuario navega hacia atrás en el mismo scroll.
     private val popularPageCache = mutableMapOf<Int, List<SAnime>>()
 
     override fun popularAnimeRequest(page: Int): Request {
-        // No se usa directamente: la lógica real vive en getPopularAnime, que también
-        // necesita hacer una petición extra para conocer el total de páginas.
-        // Se mantiene por compatibilidad con la clase abstracta.
+        // No se usa: la lógica real vive en getPopularAnime. Se mantiene por
+        // compatibilidad con la clase abstracta.
         return GET("$baseUrl/series?p=$page", headers)
     }
 
     override suspend fun getPopularAnime(page: Int): AnimesPage {
-        // Si ya sabemos el total de páginas, no hace falta la petición extra: solo pedimos
-        // la página real que corresponde. Si es la primera vez que se llama (no sabemos aún
-        // el total), tenemos que pedir la página 1 del sitio (?p=1) para leer la paginación
-        // y contar cuántas páginas hay en total.
+        // Si no conocemos el total de páginas todavía, lo obtenemos pidiendo la
+        // página 1 del sitio y leyendo su paginador.
         val totalPages = popularTotalPages ?: run {
             val firstDocument = getDocumentWithRetry("$baseUrl/series?p=1")
             val total = parseLastPageNumber(firstDocument)
             popularTotalPages = total
-            // Esa respuesta de ?p=1 es la página MÁS ANTIGUA del sitio: la cacheamos ya
-            // parseada, porque corresponde al ÚLTIMO "page" que Aniyomi pida al llegar al
-            // final del scroll (page == totalPages), y así evitamos pedirla dos veces.
+            // La página 1 del sitio es la más antigua, que corresponde al último
+            // "page" que pedirá Aniyomi: la cacheamos ya parseada para no repetirla.
             popularPageCache[1] = firstDocument.select(popularAnimeSelector())
                 .filter { el -> el.selectFirst("a.uk-position-cover") != null }
                 .map { el -> popularAnimeFromElement(el) }
@@ -75,7 +76,7 @@ class WingZeroPlus : ParsedAnimeHttpSource() {
             total
         }
 
-        // Traducimos la página que pide Aniyomi (1, 2, 3...) a la página real del sitio,
+        // Traducimos la página que pide Aniyomi a la página real del sitio,
         // recorrida de más reciente a más antigua.
         val realPage = totalPages - page + 1
         if (realPage < 1) return AnimesPage(emptyList(), false)
@@ -88,7 +89,7 @@ class WingZeroPlus : ParsedAnimeHttpSource() {
                 .filter { it.url.isNotBlank() }
         }
 
-        // Dentro de cada página, más nuevo arriba / más viejo abajo.
+        // Dentro de cada página, más nuevo arriba, más viejo abajo.
         val animes = animesInSiteOrder.reversed()
 
         val hasNext = page < totalPages
@@ -97,7 +98,6 @@ class WingZeroPlus : ParsedAnimeHttpSource() {
 
     // Lee el número de la última página del paginador de UIkit, p. ej.:
     // <li class="page-item"><a href="?p=7">7</a></li>
-    // Si no hay paginación (solo 1 página), devuelve 1.
     private fun parseLastPageNumber(document: Document): Int {
         val pageLinks = document.select("ul.uk-pagination li.page-item a[href]")
         val activePage = document.selectFirst("ul.uk-pagination li.uk-active span")?.text()?.toIntOrNull() ?: 1
@@ -107,10 +107,8 @@ class WingZeroPlus : ParsedAnimeHttpSource() {
         return maxOf(activePage, maxFromLinks)
     }
 
-    // Ejecuta una petición GET y la reintenta ante fallos de conexión transitorios
-    // (p. ej. errores de HTTP/2 como TYPE_GOAWAY / -902) antes de rendirse. Se usa en las
-    // peticiones de listado porque, al pedir 2 páginas seguidas para calcular el orden
-    // invertido, aumenta la chance de toparse con este tipo de error de conexión puntual.
+    // Reintenta ante fallos de conexión transitorios (p. ej. errores de HTTP/2)
+    // antes de rendirse.
     private suspend fun getDocumentWithRetry(url: String, maxAttempts: Int = 3): Document {
         var lastError: Exception? = null
         repeat(maxAttempts) { attempt ->
@@ -133,12 +131,12 @@ class WingZeroPlus : ParsedAnimeHttpSource() {
         title = element.selectFirst("h5.uk-panel-title")?.text() ?: ""
     }
 
-    // Evitamos :has() porque puede no estar soportado en versiones viejas de Jsoup.
-    // En su lugar sobreescribimos popularAnimeParse y detectamos la siguiente página manualmente.
+    // Evitamos :has() por compatibilidad con versiones viejas de Jsoup; en su lugar
+    // sobreescribimos popularAnimeParse y detectamos la siguiente página manualmente.
     override fun popularAnimeNextPageSelector(): String? = null
 
     override fun popularAnimeParse(response: Response): AnimesPage {
-        // No se usa: getPopularAnime maneja todo el flujo directamente.
+        // No se usa: getPopularAnime maneja el flujo directamente.
         val document = response.asJsoup()
         val animes = document.select(popularAnimeSelector())
             .filter { el -> el.selectFirst("a.uk-position-cover") != null }
@@ -149,16 +147,11 @@ class WingZeroPlus : ParsedAnimeHttpSource() {
     }
 
     // =============================== Latest ===============================
-    // "Recientes" toma la sección "Últimos episodios" de la home. Esa sección lista
-    // EPISODIOS (se repite la misma serie una vez por cada episodio reciente que tenga),
-    // así que acá deduplicamos quedándonos con la primera aparición de cada serie: como la
-    // lista ya viene ordenada de más reciente a más antiguo, la primera aparición de una
-    // serie es su capítulo más reciente. No hay paginación real: es una lista fija y corta,
-    // así que siempre devolvemos hasNextPage = false.
-    //
-    // Se cachea en memoria (como hacen googledrive/mediafire en este mismo repo) para no
-    // volver a pedir la home cada vez que se abre la pestaña "Recientes" dentro de la misma
-    // sesión de la extensión.
+    // "Recientes" toma la sección "Últimos episodios" de la home, que lista episodios
+    // (una serie se repite por cada episodio reciente). Deduplicamos quedándonos con la
+    // primera aparición de cada serie, que es su capítulo más reciente. No hay paginación
+    // real, así que siempre devolvemos hasNextPage = false. Se cachea en memoria para no
+    // repetir la petición a la home dentro de la misma sesión.
     private var latestAnimesCache: List<SAnime>? = null
 
     override suspend fun getLatestUpdates(page: Int): AnimesPage {
@@ -177,16 +170,12 @@ class WingZeroPlus : ParsedAnimeHttpSource() {
 
     override fun latestUpdatesRequest(page: Int): Request = GET(baseUrl, headers)
 
-    // OJO: la home también tiene una sección "Películas recientes" con la MISMA clase
-    // contenedora (div.uk-width-1-3.uk-margin-bottom), así que no alcanza con esa clase para
-    // distinguirlas. La marca inequívoca de "Últimos episodios" es el <p id="episode"> dentro
-    // de la tarjeta (las películas no lo tienen); filtramos por su presencia en el parse,
-    // evitando el selector CSS :has() por consistencia con el resto de la extensión.
+    // La home también tiene "Películas recientes" con la misma clase contenedora, así que
+    // distinguimos por la presencia de <p id="episode"> (las películas no lo tienen).
     override fun latestUpdatesSelector(): String = "div#tm-right-section div.uk-grid div.uk-width-1-3.uk-margin-bottom"
 
-    // Cada tarjeta de "Últimos episodios" tiene DOS <a class="uk-position-cover">: una que
-    // apunta al episodio (.../single-serie?watch=1&episode=N) y otra que apunta a la serie
-    // (.../serie/ID/slug). Nos interesa esta última para el listado de "Recientes".
+    // Cada tarjeta tiene dos <a class="uk-position-cover">: una al episodio y otra a la
+    // serie. Nos interesa la de la serie para el listado de "Recientes".
     override fun latestUpdatesFromElement(element: Element): SAnime = SAnime.create().apply {
         val animeAnchor = element.select("a.uk-position-cover")
             .firstOrNull { !it.attr("href").contains("watch=1") }
@@ -198,7 +187,7 @@ class WingZeroPlus : ParsedAnimeHttpSource() {
     override fun latestUpdatesNextPageSelector(): String? = null
 
     override fun latestUpdatesParse(response: Response): AnimesPage {
-        // No se usa: getLatestUpdates maneja todo el flujo directamente (incluyendo caché).
+        // No se usa: getLatestUpdates maneja el flujo directamente (incluyendo caché).
         val document = response.asJsoup()
         val animes = document.select(latestUpdatesSelector())
             .filter { el -> el.selectFirst("p#episode") != null } // descarta "Películas recientes"
@@ -215,15 +204,13 @@ class WingZeroPlus : ParsedAnimeHttpSource() {
     override fun searchAnimeNextPageSelector(): String? = null
 
     override fun searchAnimeParse(response: Response): AnimesPage {
-        // No se usa: getSearchAnime maneja todo el flujo directamente.
+        // No se usa: getSearchAnime maneja el flujo directamente.
         return popularAnimeParse(response)
     }
 
-    // Cachés en memoria de las opciones de año/género leídas del <select> real de la web,
-    // separadas por tipo de contenido porque /series y /movies tienen listas distintas.
-    // Se cargan en segundo plano (ver init{} más abajo) apenas se instancia la extensión,
-    // sin bloquear ninguna pantalla; así, si el sitio agrega un año o género nuevo, aparece
-    // solo la próxima vez que se abra el filtro, sin tocar el código.
+    // Cachés de las opciones de año/género leídas del <select> real de la web, separadas
+    // por tipo de contenido porque /series y /movies tienen listas distintas. Se cargan en
+    // segundo plano (ver init{}) sin bloquear ninguna pantalla.
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private data class FilterOptions(
@@ -245,9 +232,8 @@ class WingZeroPlus : ParsedAnimeHttpSource() {
         fetchFilterOptions(isMovie = false)
     }
 
-    // Lanza en segundo plano (sin bloquear) la carga de género/año para el tipo indicado,
-    // si todavía no se cargaron y no se agotaron los reintentos. Se puede volver a invocar
-    // sin problema: si ya está en curso o ya cargó, no hace nada.
+    // Lanza en segundo plano la carga de género/año para el tipo indicado, si todavía no
+    // se cargó y no se agotaron los reintentos. Es seguro llamarla más de una vez.
     private fun fetchFilterOptions(isMovie: Boolean) {
         val currentState = if (isMovie) moviesFiltersState else seriesFiltersState
         val attempts = if (isMovie) moviesFetchAttempts else seriesFetchAttempts
@@ -292,11 +278,9 @@ class WingZeroPlus : ParsedAnimeHttpSource() {
         }
     }
 
-    // Trae TODOS los resultados de un tipo (series o movies) para una búsqueda/filtro dado,
-    // recorriendo todas sus páginas reales de una vez, ya en orden de más nuevo a más viejo.
-    // Se usa solo para el caso "Tipo = Todos", donde no tiene sentido tratar de paginar dos
-    // catálogos (series y movies) con conteos de página independientes a la vez: en su lugar
-    // traemos todo de golpe y se lo entregamos a Aniyomi como una única "página" de resultados.
+    // Trae TODOS los resultados de un tipo (series o movies), recorriendo todas sus
+    // páginas de una vez en orden de más nuevo a más viejo. Se usa solo para "Tipo = Todos",
+    // donde no tiene sentido paginar dos catálogos con conteos independientes a la vez.
     private suspend fun fetchAllResults(isMovie: Boolean, query: String, genreValue: String?, yearValue: String?): List<SAnime> {
         val path = if (isMovie) "movies" else "series"
         fun buildUrl(realPage: Int): String = "$baseUrl/$path".toHttpUrl().newBuilder().apply {
@@ -329,24 +313,19 @@ class WingZeroPlus : ParsedAnimeHttpSource() {
         val yearValue = (filters.find { it is YearFilter } as? YearFilter)?.toUriPart()
         val hasActiveFilters = query.isNotBlank() || !genreValue.isNullOrBlank() || !yearValue.isNullOrBlank()
 
-        // Dispara en segundo plano (no bloqueante) la carga de género/año de Películas,
-        // por si el usuario cambió el Tipo y aún no se cargaron sus opciones. Las de Series
-        // ya se disparan siempre desde init{}.
+        // Dispara en segundo plano la carga de género/año de Películas, por si el usuario
+        // cambió el Tipo y aún no se cargaron sus opciones. Las de Series ya se disparan
+        // siempre desde init{}.
         if (typeValue == "movies" || typeValue == "all") fetchFilterOptions(isMovie = true)
 
-        // Sin filtros, sin búsqueda de texto y con Tipo = Series: es exactamente el
-        // catálogo "populares", reutilizamos la misma lógica de orden invertido global
-        // (incluye la precarga de filtros y el caché de total de páginas de populares).
+        // Sin filtros, sin búsqueda y con Tipo = Series: es el catálogo "populares", así que
+        // reutilizamos su misma lógica de orden invertido y caché.
         if (!hasActiveFilters && typeValue == "series") {
             return getPopularAnime(page)
         }
 
-        // Tipo = Todos, SIN búsqueda ni filtro: mostramos Series paginadas en el orden
-        // natural del sitio (sin el costo de invertir/contar total, como hace Populares),
-        // y en la primera página agregamos también TODAS las películas existentes. Como
-        // por ahora Películas es una sola página del sitio, esto no es pesado; si en el
-        // futuro creciera mucho, "Todos" seguiría mostrando todo, solo que esa primera
-        // carga tardaría más.
+        // Tipo = Todos, sin búsqueda ni filtro: paginamos Series en el orden natural del
+        // sitio y, en la primera página, agregamos también todas las películas existentes.
         if (typeValue == "all" && !hasActiveFilters) {
             val seriesDocument = getDocumentWithRetry("$baseUrl/series?p=$page")
             val seriesResults = seriesDocument.select(searchAnimeSelector())
@@ -363,10 +342,8 @@ class WingZeroPlus : ParsedAnimeHttpSource() {
             return AnimesPage(seriesResults, hasNext)
         }
 
-        // Tipo = Todos, CON búsqueda/filtro activo: traemos series y películas completas
-        // (para esa búsqueda/filtro puntual) y las combinamos en una sola lista, series
-        // primero y luego películas. No hay paginación real en este caso: se entrega todo
-        // junto de una vez.
+        // Tipo = Todos, con búsqueda/filtro activo: traemos series y películas completas
+        // para esa búsqueda y las combinamos en una sola lista, sin paginación real.
         if (typeValue == "all") {
             if (page > 1) return AnimesPage(emptyList(), false)
             val seriesResults = fetchAllResults(isMovie = false, query, genreValue, yearValue)
@@ -385,8 +362,7 @@ class WingZeroPlus : ParsedAnimeHttpSource() {
         }.build().toString()
 
         // Con filtros/búsqueda activos, el sitio también pagina de más antiguo a más
-        // reciente, así que aplicamos el mismo criterio: total real de páginas primero,
-        // luego navegamos desde la última hacia atrás.
+        // reciente, así que aplicamos el mismo criterio de total de páginas invertido.
         val firstDocument = getDocumentWithRetry(buildUrl(1))
         val totalPages = parseLastPageNumber(firstDocument)
 
@@ -410,7 +386,7 @@ class WingZeroPlus : ParsedAnimeHttpSource() {
     }
 
     override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
-        // No se usa: getSearchAnime maneja todo el flujo directamente.
+        // No se usa: getSearchAnime maneja el flujo directamente.
         val typeFilter = filters.find { it is TypeFilter } as? TypeFilter
         val isMovie = typeFilter?.toUriPart() == "movies"
         val path = if (isMovie) "movies" else "series"
@@ -441,13 +417,13 @@ class WingZeroPlus : ParsedAnimeHttpSource() {
     override fun episodeListSelector(): String = "div#episodes div.episodes"
 
     override fun episodeFromElement(element: Element): SEpisode {
-        val name = element.selectFirst("dt")?.text()?.trim() ?: "Episodio"
-        val epNum = EP_NUMBER_REGEX.find(name)?.groupValues?.get(1)?.toFloatOrNull() ?: 0F
+        val rawName = element.selectFirst("dt")?.text()?.trim() ?: "Episodio"
+        val display = FilenameUtils.buildEpisodeDisplay(rawName, showFilename)
         val relUrl = element.selectFirst("a.uk-position-cover")?.attr("href") ?: ""
         return SEpisode.create().apply {
-            this.name = name
+            name = display.name
             url = relUrl // se convierte a absoluta en episodeListParse
-            episode_number = epNum
+            episode_number = display.episodeNumber
         }
     }
 
@@ -469,11 +445,9 @@ class WingZeroPlus : ParsedAnimeHttpSource() {
     }
 
     override fun episodeListParse(response: Response): List<SEpisode> {
-        // La URL de la serie es algo como:
-        // https://plus.wing-zero-network.org/serie/7/claymore
-        // El episodio tiene href relativo: "single-serie?watch=1&episode=106"
-        // La URL absoluta correcta es:
-        // https://plus.wing-zero-network.org/serie/7/single-serie?watch=1&episode=106
+        // La URL de la serie es .../serie/7/claymore y el episodio tiene href relativo
+        // "single-serie?watch=1&episode=106"; la URL absoluta correcta reemplaza el slug
+        // por ese href: .../serie/7/single-serie?watch=1&episode=106
         val serieBaseUrl = response.request.url.toString()
             .substringBeforeLast("/") // quita el slug, deja .../serie/7
 
@@ -511,38 +485,15 @@ class WingZeroPlus : ParsedAnimeHttpSource() {
                 ?.substringBefore("/")
             ?: throw Exception("No se encontró enlace de Google Drive para este episodio.")
 
-        // Cargamos la página de preview de GD para extraer la URL de stream firmada
-        val previewUrl = "https://drive.google.com/file/d/$fileId/preview"
-        val previewHeaders = headers.newBuilder()
-            .add("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-            .add("Referer", "https://drive.google.com/")
-            .build()
-        val previewResp = client.newCall(GET(previewUrl, previewHeaders)).execute()
-        val previewBody = previewResp.body.string()
-
-        // GD embebe la URL de stream en el HTML como "fmt_stream_map" o en un array de URLs
-        // Buscamos patrones conocidos de URLs de stream de GD
-        val streamUrl = Regex(""""(https://[^"]*googleusercontent\.com[^"]*\.(mp4|webm)[^"]*?)"""")
-            .find(previewBody)?.groupValues?.get(1)
-            ?: Regex(""""url":"(https://[^"]*googlevideo\.com[^"]*?)"""")
-                .find(previewBody)?.groupValues?.get(1)?.replace("\\u003d", "=")?.replace("\\u0026", "&")
-            ?: gdExtractor.videosFromUrl(fileId).firstOrNull()?.videoUrl
-            ?: throw Exception("No se pudo obtener la URL de stream para este episodio.")
-
-        return listOf(Video(streamUrl, "Video", streamUrl, previewHeaders))
+        return gdExtractor.videosFromUrl(fileId)
     }
 
     // ============================== Filters ===============================
 
     // Género y Año se cargan dinámicamente desde el <select> real de /series o /movies
-    // (ver fetchFilterOptions), así que sus opciones no están hardcodeadas: si el sitio
-    // agrega un año o género nuevo, aparecerá solo, sin tocar el código.
-    //
-    // La carga para "series" se dispara en segundo plano desde init{}, apenas se instancia
-    // la extensión, así que normalmente ya está lista para cuando el usuario abre el panel
-    // de filtros. Si aún no terminó (o el usuario cambia a Películas, cuyas opciones recién
-    // se disparan en la primera búsqueda de ese tipo), se muestra un aviso para reintentar
-    // presionando "Restablecer" en el panel de filtros.
+    // (ver fetchFilterOptions), así que si el sitio agrega opciones nuevas aparecen solas.
+    // La carga para "series" se dispara desde init{}; si todavía no terminó (o el usuario
+    // cambió a Películas), se muestra un aviso para reintentar con "Restablecer".
     override fun getFilterList(): AnimeFilterList {
         fetchFilterOptions(isMovie = false)
 
@@ -595,10 +546,14 @@ class WingZeroPlus : ParsedAnimeHttpSource() {
         fun toUriPart() = vals[state].second
     }
 
-    companion object {
-        private val EP_NUMBER_REGEX = Regex(
-            """Episodio\s+0*(\d+(?:\.\d+)?)""",
-            RegexOption.IGNORE_CASE,
+    // ============================ Preferencias ===============================
+
+    override fun setupPreferenceScreen(screen: PreferenceScreen) {
+        screen.addSwitchPreference(
+            key = WingZeroPlusPreferences.PREF_SHOW_FILENAME,
+            default = false,
+            title = "Mostrar nombre del archivo",
+            summary = "Activado: muestra el nombre real del episodio.\nDesactivado: muestra \"Episodio 1\", \"Episodio 2\"…",
         )
     }
 }
