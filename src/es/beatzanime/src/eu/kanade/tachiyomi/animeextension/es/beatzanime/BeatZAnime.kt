@@ -1,5 +1,8 @@
 package eu.kanade.tachiyomi.animeextension.es.beatzanime
 
+import androidx.preference.PreferenceScreen
+import aniyomi.lib.filenameutils.FilenameUtils
+import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.AnimesPage
 import eu.kanade.tachiyomi.animesource.model.SAnime
@@ -8,6 +11,8 @@ import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.animesource.online.ParsedAnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.util.asJsoup
+import keiyoushi.utils.addSwitchPreference
+import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parseAs
 import kotlinx.serialization.Serializable
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -18,7 +23,9 @@ import okhttp3.Response
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 
-class BeatZAnime : ParsedAnimeHttpSource() {
+class BeatZAnime :
+    ParsedAnimeHttpSource(),
+    ConfigurableAnimeSource {
 
     override val name = "BeatZ Anime"
 
@@ -31,9 +38,13 @@ class BeatZAnime : ParsedAnimeHttpSource() {
 
     override val supportsLatest = true
 
+    private val preferences by getPreferencesLazy()
+
+    private val showFilename: Boolean
+        get() = BeatZAnimePreferences.showFilename(preferences)
+
     // ============================== Popular ===============================
-    // El catálogo completo (orden alfabético) vive en /lista-animes/ y se
-    // renderiza entero en una sola página (sin paginación de servidor).
+    // El catálogo completo vive en /lista-animes/ sin paginación de servidor.
 
     override fun popularAnimeRequest(page: Int): Request = GET("$baseUrl/lista-animes/", headers)
 
@@ -73,15 +84,11 @@ class BeatZAnime : ParsedAnimeHttpSource() {
     override fun latestUpdatesNextPageSelector(): String = "ul.pagination > li.active + li:not(.disabled)"
 
     // =============================== Search ===============================
-    // IMPORTANTE: /lista-animes/ no filtra en el servidor. Devuelve SIEMPRE
-    // el catálogo completo como HTML estático (cada .anime-card trae los
-    // atributos data-name/data-fuente/data-estado/data-tipo) y un script en
-    // el propio navegador oculta las tarjetas que no matchean. Como la
-    // extensión no ejecuta JS, hay que replicar ese filtrado aquí, en Kotlin,
-    // sobre el HTML completo.
+    // /lista-animes/ no filtra en el servidor: siempre devuelve el catálogo
+    // completo, con los datos de filtro en atributos data-* de cada tarjeta,
+    // y el sitio filtra en el navegador con JS. Como la extensión no ejecuta
+    // JS, se sobrescribe getSearchAnime para replicar ese filtrado en Kotlin.
 
-    // La request siempre trae el catálogo completo; query y filtros no se
-    // envían al servidor porque este no los soporta.
     override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request = GET("$baseUrl/lista-animes/", headers)
 
     override fun searchAnimeSelector(): String = popularAnimeSelector()
@@ -90,10 +97,6 @@ class BeatZAnime : ParsedAnimeHttpSource() {
 
     override fun searchAnimeNextPageSelector(): String? = null
 
-    // Se sobrescribe el punto de entrada de más alto nivel para tener acceso
-    // simultáneo a `query` y `filters` (searchAnimeParse solo recibe la
-    // Response). Aquí se aplica el mismo filtrado que el JS del sitio hace
-    // en el navegador, ya que el servidor siempre devuelve todo sin filtrar.
     override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
         val request = searchAnimeRequest(page, query, filters)
         val document = client.newCall(request).execute().asJsoup()
@@ -171,7 +174,7 @@ class BeatZAnime : ParsedAnimeHttpSource() {
 
     override fun episodeListParse(response: Response): List<SEpisode> {
         val document = response.asJsoup()
-        val episodeList = mutableListOf<SEpisode>()
+        val episodeList = mutableListOf<Pair<SEpisode, String>>()
 
         val onclickAttr = document.select("button[onclick*=$indexHost]").firstOrNull { btn ->
             val onclick = btn.attr("onclick")
@@ -222,23 +225,24 @@ class BeatZAnime : ParsedAnimeHttpSource() {
                     val fileExt = item.name.substringAfterLast(".")
                     if (!SUPPORTED_FORMATS.any { it.equals(fileExt, true) }) return@forEach
 
-                    episodeList.add(
-                        SEpisode.create().apply {
-                            name = item.name
-                            url = "$path/${item.name}"
-                            scanlator = buildList {
-                                if (relativePath != "") add(relativePath)
-                                add(item.size.formatBytes())
-                            }.joinToString(" • ")
-                        },
-                    )
+                    val display = FilenameUtils.buildEpisodeDisplay(item.name, showFilename)
+                    val episode = SEpisode.create().apply {
+                        name = display.name
+                        url = "$path/${item.name}"
+                        episode_number = display.episodeNumber
+                        scanlator = buildList {
+                            if (relativePath != "") add(relativePath)
+                            add(item.size.formatBytes())
+                        }.joinToString(" • ")
+                    }
+                    episodeList.add(episode to item.name)
                 }
             }
         }
 
         traverseFolder(basePath, "")
 
-        return episodeList.reversed()
+        return FilenameUtils.sortByEpisodeNumberDescending(episodeList) { it.second }.map { it.first }
     }
 
     @Serializable
@@ -265,6 +269,17 @@ class BeatZAnime : ParsedAnimeHttpSource() {
         this > 1 -> "$this bytes"
         this == 1L -> "$this byte"
         else -> ""
+    }
+
+    // ============================ Preferences ==============================
+
+    override fun setupPreferenceScreen(screen: PreferenceScreen) {
+        screen.addSwitchPreference(
+            key = BeatZAnimePreferences.PREF_SHOW_FILENAME,
+            default = false,
+            title = "Mostrar nombre del archivo",
+            summary = "Activado: muestra el nombre real del archivo.\nDesactivado: muestra \"Episodio 1\", \"Episodio 2\"…",
+        )
     }
 
     // ============================ Video Links =============================
