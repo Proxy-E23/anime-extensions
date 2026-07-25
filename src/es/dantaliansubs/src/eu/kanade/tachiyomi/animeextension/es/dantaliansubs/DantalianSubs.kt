@@ -37,10 +37,14 @@ class DantalianSubs :
 
     // El challenge de Cloudflare aparece en todo el sitio, no solo en un CDN de video
     // puntual (los videos viven en Google Drive), así que el interceptor va en el client
-    // principal. La cookie resultante queda cacheada por Android hasta que expire.
-    override val client: OkHttpClient = super.client.newBuilder()
-        .addInterceptor(CloudflareInterceptor(super.client))
-        .build()
+    // principal. Se usa lazy porque CloudflareInterceptor toca clases de android.webkit,
+    // que no existen en el Inspector (corre en JVM pura); con lazy solo se instancia al
+    // hacer la primera petición real, no al construir la fuente.
+    override val client: OkHttpClient by lazy {
+        super.client.newBuilder()
+            .addInterceptor(CloudflareInterceptor(super.client))
+            .build()
+    }
 
     private val preferences by getPreferencesLazy()
 
