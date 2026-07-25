@@ -26,7 +26,9 @@ import org.jsoup.nodes.TextNode
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
 
-class DantalianSubs : ParsedAnimeHttpSource(), ConfigurableAnimeSource {
+class DantalianSubs :
+    ParsedAnimeHttpSource(),
+    ConfigurableAnimeSource {
 
     override val name = "DantalianSubs"
     override val baseUrl = "https://dantaliansubs.moe"
