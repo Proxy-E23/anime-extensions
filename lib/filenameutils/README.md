@@ -86,9 +86,9 @@ Como es segura por defecto (no cambia nada si no detecta multi-temporada), se pu
 
 ### El problema
 
-Un archivo que no coincide con ningún patrón de categoría (OP/ED/Special/etc.) y tampoco tiene ningún número identificable -- por ejemplo, una película suelta con nombre propio como `Movie Title.mkv`, sin "movie" ni "película" en el nombre -- no tiene ninguna evidencia textual de qué es. No hay heurística segura para adivinar la categoría (asumir "es una película" por descarte generaría falsos positivos con otros casos, como un episodio suelto sin numerar).
+Un archivo que no coincide con ningún patrón de categoría (OP/ED/Special/etc.) y tampoco tiene ningún número identificable -- por ejemplo, una película suelta con nombre propio, sin "movie" ni "película" en el nombre (ej. `Standalone Title.mkv`) -- no tiene ninguna evidencia textual de qué es. No hay heurística segura para adivinar la categoría (asumir "es una película" por descarte generaría falsos positivos con otros casos, como un episodio suelto sin numerar).
 
-Por eso existe `EpisodeCategory.UNKNOWN`: no afirma saber qué es el archivo, solo reconoce que no hay evidencia. En vez de una etiqueta genérica ("Episodio ?"), se muestra el nombre real del archivo, limpio de tags entre `[]`/`{}`/`()` y sin extensión -- ya que el nombre real (`Movie Title`) es más útil que cualquier etiqueta inventada.
+Por eso existe `EpisodeCategory.UNKNOWN`: no afirma saber qué es el archivo, solo reconoce que no hay evidencia. En vez de una etiqueta genérica ("Episodio ?"), se muestra el nombre real del archivo, limpio de tags entre `[]`/`{}`/`()` y sin extensión -- ya que el nombre real (`Standalone Title`) es más útil que cualquier etiqueta inventada.
 
 ### El `episode_number` de `UNKNOWN`
 

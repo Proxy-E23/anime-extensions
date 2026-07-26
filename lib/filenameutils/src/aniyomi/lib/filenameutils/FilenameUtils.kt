@@ -252,7 +252,7 @@ object FilenameUtils {
                 // de NEGATIVE_INFINITY para no quedar detrás de categorías
                 // (como EXTRA) que puedan tener números negativos válidos.
                 number ?: -1f
-            }
+            },
     )
 
     // Etiqueta corta para mostrar en el nombre del episodio cuando no es
@@ -448,7 +448,7 @@ object FilenameUtils {
         return withUnknownFixed.sortedWith(
             compareBy<SeasonedEpisode<T>> { detectCategory(nameSelector(it.item)).sortPriority }
                 .thenBy { detectCategory(nameSelector(it.item)) == EpisodeCategory.EXTRA }
-                .thenByDescending { it.display.episodeNumber }
+                .thenByDescending { it.display.episodeNumber },
         )
     }
 
