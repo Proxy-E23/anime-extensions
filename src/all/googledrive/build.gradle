@@ -1,7 +1,7 @@
 ext {
     extName = 'Google Drive'
     extClass = '.GoogleDrive'
-    extVersionCode = 25
+    extVersionCode = 26
 }
 
 apply plugin: "kei.plugins.extension.legacy"
