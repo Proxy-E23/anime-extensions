@@ -22,18 +22,25 @@ object FilenameUtils {
     // permite que texto como "x264" se cuele como candidato a episodio.
     private val BRACKETED_CONTENT_REGEX = Regex("""[\[{(][^\[\]{}()]*[]})]""")
 
-    // Patrón explícito: EP12, Episode 12, Capítulo 12, etc. Se prueba
-    // primero por ser más confiable que "el último número del nombre".
+    // Patrón explícito: EP12, Episode 12, Episodio 12, Capítulo 12, etc. Se
+    // prueba primero por ser más confiable que "el último número del
+    // nombre" -- sin esto, un número que aparezca más adelante en el
+    // título (ej. "Episodio 02: ... tiene 38 grados...") se tomaría por
+    // error como el número de episodio.
     private val EXPLICIT_EPISODE_REGEX = Regex(
-        """(?:episode|ep|cap[ií]tulo|cap)\.?\s*(\d+)""",
+        """(?:episode|episodio|ep|cap[ií]tulo|cap)\.?\s*(\d+)""",
         RegexOption.IGNORE_CASE,
     )
 
     // Palabras que NO son el número de episodio aunque tengan un dígito
-    // pegado (OP2, NCED, IS02, v2...) -- openings/endings/insert songs y
-    // números de versión de un release, no del episodio.
+    // pegado (OP2, NCED, IS02, v2, x264...) -- openings/endings/insert
+    // songs, números de versión y códecs de video, no el episodio. Estas
+    // normalmente ya se limpian como parte de un tag entre paréntesis/
+    // corchetes (ej. "(x264 AAC)"), pero se filtran también aquí como red
+    // de seguridad para cuando ese tag viene con el cierre mal formado
+    // (ej. "(x264 FLAC.mkv", sin ")") y el número quedaría suelto en el título.
     private val NON_EPISODE_TAG_REGEX = Regex(
-        """^(?:(?:nc)?(?:op|ed)\d*|isong\d*|is\d*|v\d+)$""",
+        """^[\[({]?(?:(?:nc)?(?:op|ed)\d*|isong\d*|is\d*|v\d+|[xh]26[45])$""",
         RegexOption.IGNORE_CASE,
     )
 
@@ -319,7 +326,12 @@ object FilenameUtils {
             category == EpisodeCategory.UNKNOWN -> {
                 val normalized = rawName.replace(Regex("""\s+"""), " ").trim()
                 val withoutExtension = normalized.substringBeforeLast('.')
-                BRACKETED_CONTENT_REGEX.replace(withoutExtension, " ").replace(Regex("""\s+"""), " ").trim()
+                val cleaned = BRACKETED_CONTENT_REGEX.replace(withoutExtension, " ").replace(Regex("""\s+"""), " ").trim()
+                // Si el título real estaba TODO envuelto en corchetes/paréntesis
+                // (ej. "[Grupo][Título][1080p].mkv"), la limpieza anterior
+                // deja el nombre vacío -- en ese caso se usa el nombre sin
+                // limpiar (solo sin extensión) para no mostrar un nombre en blanco.
+                cleaned.ifBlank { withoutExtension.trim() }
             }
             showFilename -> rawName
             category == EpisodeCategory.EPISODE -> "Episodio ${number?.let { formatEpisodeNumber(it) } ?: "?"}"
