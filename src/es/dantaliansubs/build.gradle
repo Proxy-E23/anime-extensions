@@ -1,7 +1,7 @@
 ext {
     extName = 'DantalianSubs'
     extClass = '.DantalianSubs'
-    extVersionCode = 5
+    extVersionCode = 6
 }
 
 apply plugin: "kei.plugins.extension.legacy"
