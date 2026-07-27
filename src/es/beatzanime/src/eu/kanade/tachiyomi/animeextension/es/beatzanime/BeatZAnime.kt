@@ -174,7 +174,14 @@ class BeatZAnime :
 
     override fun episodeListParse(response: Response): List<SEpisode> {
         val document = response.asJsoup()
-        val episodeList = mutableListOf<Pair<SEpisode, String>>()
+
+        // Se recolectan primero todos los archivos crudos durante la
+        // recursión (sin construir SEpisode todavía), porque
+        // sortBySeasonAndEpisodeDescending necesita la lista completa de una
+        // sola vez para poder aplicar el offset correcto a los UNKNOWN y
+        // detectar temporadas múltiples -- no puede aplicarse de forma
+        // incremental dentro de la recursión.
+        val rawFiles = mutableListOf<RawFileEntry>()
 
         val onclickAttr = document.select("button[onclick*=$indexHost]").firstOrNull { btn ->
             val onclick = btn.attr("onclick")
@@ -225,25 +232,43 @@ class BeatZAnime :
                     val fileExt = item.name.substringAfterLast(".")
                     if (!SUPPORTED_FORMATS.any { it.equals(fileExt, true) }) return@forEach
 
-                    val display = FilenameUtils.buildEpisodeDisplay(item.name, showFilename)
-                    val episode = SEpisode.create().apply {
-                        name = display.name
-                        url = "$path/${item.name}"
-                        episode_number = display.episodeNumber
-                        scanlator = buildList {
-                            if (relativePath != "") add(relativePath)
-                            add(item.size.formatBytes())
-                        }.joinToString(" • ")
-                    }
-                    episodeList.add(episode to item.name)
+                    rawFiles.add(
+                        RawFileEntry(
+                            name = item.name,
+                            url = "$path/${item.name}",
+                            relativePath = relativePath,
+                            sizeLabel = item.size.formatBytes(),
+                        ),
+                    )
                 }
             }
         }
 
         traverseFolder(basePath, "")
 
-        return FilenameUtils.sortByEpisodeNumberDescending(episodeList) { it.second }.map { it.first }
+        return FilenameUtils.sortBySeasonAndEpisodeDescending(rawFiles, { it.name }, showFilename)
+            .map { seasoned ->
+                SEpisode.create().apply {
+                    name = seasoned.display.name
+                    url = seasoned.item.url
+                    episode_number = seasoned.display.episodeNumber
+                    scanlator = buildList {
+                        if (seasoned.item.relativePath != "") add(seasoned.item.relativePath)
+                        add(seasoned.item.sizeLabel)
+                    }.joinToString(" • ")
+                }
+            }
     }
+
+    // Item crudo recolectado durante traverseFolder, antes de resolver su
+    // nombre/número de episodio -- se necesita la lista completa para poder
+    // usar sortBySeasonAndEpisodeDescending.
+    private data class RawFileEntry(
+        val name: String,
+        val url: String,
+        val relativePath: String,
+        val sizeLabel: String,
+    )
 
     @Serializable
     class IndexResponseDto(

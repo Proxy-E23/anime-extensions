@@ -337,21 +337,17 @@ class MediaFireSrc :
 
         val videoFiles: List<MediaFireFolderEntry> = extractor.listFiles(key).filter { isVideo(it.filename) }
 
-        // Especiales (OP, ED, OVA, etc.) primero, luego episodios numerados
-        // de mayor a menor. Nombre y episode_number vienen de buildEpisodeDisplay.
-        val sortedFiles = FilenameUtils.sortByEpisodeNumberDescending(videoFiles) { it.filename }
-
-        return sortedFiles.map { file ->
-            val display = FilenameUtils.buildEpisodeDisplay(file.filename, showFilename)
-            SEpisode.create().apply {
-                this.url = "file::${file.quickkey}::${file.filename}"
-                name = display.name
-                episode_number = display.episodeNumber
-                date_upload = runCatching {
-                    dateFormat.parse(file.created)?.time ?: 0L
-                }.getOrElse { 0L }
+        return FilenameUtils.sortBySeasonAndEpisodeDescending(videoFiles, { it.filename }, showFilename)
+            .map { seasoned ->
+                SEpisode.create().apply {
+                    this.url = "file::${seasoned.item.quickkey}::${seasoned.item.filename}"
+                    name = seasoned.display.name
+                    episode_number = seasoned.display.episodeNumber
+                    date_upload = runCatching {
+                        dateFormat.parse(seasoned.item.created)?.time ?: 0L
+                    }.getOrElse { 0L }
+                }
             }
-        }
     }
 
     // ── Videos ────────────────────────────────────────────────────────────────

@@ -193,13 +193,18 @@ class GoogleDriveScraper(private val client: OkHttpClient, private val headers: 
         stopPosition: Int? = null,
     ): List<ScrapedEpisode> {
         val episodeList = mutableListOf<ScrapedEpisode>()
+        // Global a todo el recorrido (raíz + subcarpetas) -- si fuera local a
+        // cada llamada de traverse(), cada subcarpeta reiniciaría la cuenta en
+        // 1 y produciría episodeNumber duplicados entre la raíz y sus
+        // subcarpetas (ej. "Episodio 1" de la raíz y "Extra 1" de una
+        // subcarpeta "Extras/" quedarían con el mismo número).
+        var counter = 1
 
         fun traverse(url: String, path: String, recursionDepth: Int) {
             if (recursionDepth == maxRecursionDepth) return
 
             val folderId = FOLDER_ID_REGEX.find(url)?.groupValues?.get(1) ?: return
             var pageToken: String? = ""
-            var counter = 1
 
             while (pageToken != null) {
                 val page = listFolderItems(folderId, pageToken) ?: return

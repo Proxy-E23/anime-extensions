@@ -387,20 +387,16 @@ class GoogleDrive :
         val showFilename = GoogleDrivePreferences.showFilename(preferences)
 
         // El rango start/stop ya se aplicó dentro de scrapeEpisodes, por posición original.
-        val episodeList = scraped.map { ep ->
-            val display = FilenameUtils.buildEpisodeDisplay(ep.name, showFilename)
-            SEpisode.create().apply {
-                name = display.name
-                url = ep.url
-                episode_number = display.episodeNumber
-                date_upload = ep.dateUploadMillis
-                scanlator = ep.sizeLabel
-            } to ep.name
-        }
-
-        // Especiales (OP, ED, OVA...) arriba, luego episodios de mayor a menor.
-        return FilenameUtils.sortByEpisodeNumberDescending(episodeList) { it.second }
-            .map { it.first }
+        return FilenameUtils.sortBySeasonAndEpisodeDescending(scraped, { it.name }, showFilename)
+            .map { seasoned ->
+                SEpisode.create().apply {
+                    name = seasoned.display.name
+                    url = seasoned.item.url
+                    episode_number = seasoned.display.episodeNumber
+                    date_upload = seasoned.item.dateUploadMillis
+                    scanlator = seasoned.item.sizeLabel
+                }
+            }
     }
 
     override fun episodeListParse(response: Response): List<SEpisode> = throw UnsupportedOperationException()

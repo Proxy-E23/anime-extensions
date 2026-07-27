@@ -278,12 +278,7 @@ class Mega :
             nodes
         }
 
-        // Orden delegado a FilenameUtils.sortByEpisodeNumberDescending: los
-        // especiales (OP, ED, OVA, Special/Extra, etc.) van arriba de todo,
-        // y luego los episodios numerados de mayor a menor.
-        val videoNodes = FilenameUtils.sortByEpisodeNumberDescending(
-            relevantNodes.filter { !it.isFolder && isVideoName(it.name) },
-        ) { it.name }
+        val videoNodes = relevantNodes.filter { !it.isFolder && isVideoName(it.name) }
 
         if (videoNodes.isEmpty()) {
             val noKey = relevantNodes.count { !it.isFolder && it.fileKey == null }
@@ -296,21 +291,22 @@ class Mega :
             throw Exception("No se encontraron videos en esta carpeta de MEGA.$detail")
         }
 
-        // Nombre y episode_number resueltos juntos por
-        // FilenameUtils.buildEpisodeDisplay: nombre real del archivo (si
+        // Orden y nombre resueltos juntos por
+        // FilenameUtils.sortBySeasonAndEpisodeDescending: los especiales (OP,
+        // ED, OVA, Special/Extra, etc.) van arriba de todo, luego los
+        // episodios numerados de mayor a menor; nombre real del archivo (si
         // showFilename) o etiqueta genérica ("Episodio 24", "OP 2") según
         // categoría y número detectados.
-        return videoNodes.map { node ->
-            val display = FilenameUtils.buildEpisodeDisplay(node.name, showFilename)
-
-            SEpisode.create().apply {
-                name = display.name
-                url = MegaEpisodeData(fileHandle = node.handle, fileKey = null, folderHandle = link.handle).toJsonString()
-                episode_number = display.episodeNumber
-                date_upload = node.timestamp
-                scanlator = formatBytes(node.size)
+        return FilenameUtils.sortBySeasonAndEpisodeDescending(videoNodes, { it.name }, showFilename)
+            .map { seasoned ->
+                SEpisode.create().apply {
+                    name = seasoned.display.name
+                    url = MegaEpisodeData(fileHandle = seasoned.item.handle, fileKey = null, folderHandle = link.handle).toJsonString()
+                    episode_number = seasoned.display.episodeNumber
+                    date_upload = seasoned.item.timestamp
+                    scanlator = formatBytes(seasoned.item.size)
+                }
             }
-        }
     }
 
     private fun isVideoName(name: String): Boolean {

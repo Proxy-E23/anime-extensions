@@ -337,12 +337,33 @@ class FallenSubs :
 
     override fun episodeListParse(response: Response): List<SEpisode> {
         val document = response.asJsoup()
-        // Se guarda junto al rawName real de cada archivo (nombre real, no el label ya
-        // transformado por showFilename) para poder ordenar sin volver a parsear texto.
-        val episodes = mutableListOf<Pair<SEpisode, String>>()
+        // "Tipo: Movie" / "Tipo: Serie de TV" -- se usa como fallback de
+        // nombre cuando una fila no tiene ningún texto identificable (ni
+        // columna de etiqueta, ni palabra clave en la fila), en vez de un
+        // "Batch" genérico que no dice nada al usuario.
+        val fullText = document.selectFirst("div.inner")?.text().orEmpty()
+        val tipoValue = TIPO_REGEX.find(fullText)?.groupValues?.get(1)?.trim()
+        val isMovie = tipoValue?.contains("movie", ignoreCase = true) == true ||
+            tipoValue?.contains("película", ignoreCase = true) == true ||
+            tipoValue?.contains("pelicula", ignoreCase = true) == true
+
+        // Se recolectan primero todos los items crudos (con su quality de
+        // columna), porque sortBySeasonAndEpisodeDescending necesita la
+        // lista completa de una sola vez para aplicar el offset correcto a
+        // los UNKNOWN y ordenar bien los especiales con/sin número.
+        val rawEntries = mutableListOf<RawEpisodeEntry>()
 
         document.select(episodeListSelector()).forEach { table ->
-            val headerCells = table.select("tr").firstOrNull()?.select("td, th") ?: return@forEach
+            val allRows = table.select("tr")
+            val firstRow = allRows.firstOrNull() ?: return@forEach
+            // Algunas tablas no tienen fila de encabezado separada -- la
+            // primera fila ya es una entrega real (ej. "OP Credless" +
+            // links de Mega, sin ninguna fila de "1080p/720p" antes). Se
+            // detecta por la presencia de links de Mega: un header nunca
+            // los tiene, solo texto.
+            val firstRowIsHeader = firstRow.select("a[href*=mega.nz]").isEmpty()
+
+            val headerCells = if (firstRowIsHeader) firstRow.select("td, th") else emptyList()
             // Solo saltamos la primera celda si es una etiqueta de fila ("CAPITULO", "EP",
             // etc.); algunas tablas empiezan directo con la calidad (ej. "1080p").
             val firstHeaderText = headerCells.firstOrNull()?.text()?.trim().orEmpty()
@@ -354,25 +375,64 @@ class FallenSubs :
             // Solo la mejor resolución disponible (idealmente 1080p): ignoramos 720p y
             // menores. Columnas sin resolución reconocible no se descartan aquí para no
             // perder contenido válido; se filtran más abajo si hace falta.
-            val bestQuality = qualityNames.mapNotNull { extractResolution(it) }.maxOrNull()
-            val resolutionCandidates = qualityNames.indices.filter { index ->
-                val resolution = extractResolution(qualityNames[index])
-                bestQuality == null || resolution == null || resolution == bestQuality
+            // Sin qualityNames (tabla sin fila de calidades, ej. "OP Credless"
+            // + links sin encabezado), no hay nada que comparar -- se
+            // permiten todas las columnas de datos en vez de bloquearlas
+            // todas (qualityNames.indices sería un rango vacío).
+            val allowedIndices = if (qualityNames.isEmpty()) {
+                null
+            } else {
+                val bestQuality = qualityNames.mapNotNull { extractResolution(it) }.maxOrNull()
+                val resolutionCandidates = qualityNames.indices.filter { index ->
+                    val resolution = extractResolution(qualityNames[index])
+                    bestQuality == null || resolution == null || resolution == bestQuality
+                }
+                pickBestQualityIndices(resolutionCandidates, qualityNames).toSet()
             }
-            val allowedIndices = pickBestQualityIndices(resolutionCandidates, qualityNames).toSet()
 
-            table.select("tr").drop(1).forEach { row ->
+            val dataRows = if (firstRowIsHeader) allRows.drop(1) else allRows
+
+            dataRows.forEach { row ->
                 val cells = row.select("td")
                 if (cells.isEmpty()) return@forEach
-                val rowName = if (hasRowLabelColumn) {
-                    cells.first()?.text()?.trim().orEmpty().ifBlank { "Batch" }
-                } else {
-                    "Batch"
+                val firstCellText = cells.first()?.text()?.trim().orEmpty()
+                val rowName = when {
+                    // Columna de etiqueta reconocida ("CAPITULO 5", etc.)
+                    hasRowLabelColumn && firstCellText.isNotBlank() -> firstCellText
+                    // Sin columna de etiqueta, pero la primera celda de la
+                    // fila trae texto identificable de todas formas (ej.
+                    // "OP Credless", "ED Credless") -- pasa por
+                    // detectCategory más adelante vía FilenameUtils, así que
+                    // alcanza con no perder ese texto acá.
+                    !hasRowLabelColumn && firstCellText.isNotBlank() && cells.size > qualityNames.size -> firstCellText
+                    // Nada identificable en la fila: se usa el tipo de la
+                    // serie si se pudo determinar, o "Extra" como último
+                    // recurso genérico (más claro para el usuario que "Batch").
+                    isMovie -> "Película"
+                    else -> "Extra"
                 }
-                val dataCells = if (columnOffset > 0) cells.drop(columnOffset) else cells
+                val dataCells = if (!hasRowLabelColumn && firstCellText.isNotBlank() && cells.size > qualityNames.size) {
+                    cells.drop(1)
+                } else if (columnOffset > 0) {
+                    cells.drop(columnOffset)
+                } else {
+                    cells
+                }
 
-                dataCells.forEachIndexed { index, cell ->
-                    if (index !in allowedIndices) return@forEachIndexed
+                // Sin qualityNames, las columnas de datos no representan
+                // calidades identificables -- se toma solo la primera con
+                // link de Mega válido para no duplicar la misma entrega
+                // (ej. "OP Credless" en 1080p y 720p sin etiquetar) como si
+                // fueran dos episodios distintos.
+                val cellsToProcess = if (qualityNames.isEmpty()) {
+                    dataCells.firstOrNull { it.selectFirst("a[href*=mega.nz]") != null }
+                        ?.let { listOf(it) } ?: emptyList()
+                } else {
+                    dataCells
+                }
+
+                cellsToProcess.forEachIndexed { index, cell ->
+                    if (allowedIndices != null && index !in allowedIndices) return@forEachIndexed
                     val megaHref = cell.selectFirst("a[href*=mega.nz]")?.attr("href") ?: return@forEachIndexed
                     val quality = qualityNames.getOrNull(index) ?: "Descarga"
                     val link = extractor.parseLink(megaHref) ?: return@forEachIndexed
@@ -385,31 +445,47 @@ class FallenSubs :
                                 emptyList()
                             }
                             nodes.filter { !it.isFolder }.forEach { node ->
-                                val display = FilenameUtils.buildEpisodeDisplay(node.name, showFilename)
-                                val episode = SEpisode.create().apply {
-                                    name = if (showFilename) "${display.name} [$quality]" else display.name
-                                    url = encodeEpisodeUrl(megaHref, node.handle, node.name)
-                                    episode_number = display.episodeNumber
-                                }
-                                episodes.add(episode to node.name)
+                                rawEntries.add(
+                                    RawEpisodeEntry(
+                                        rawName = node.name,
+                                        quality = quality,
+                                        url = encodeEpisodeUrl(megaHref, node.handle, node.name),
+                                    ),
+                                )
                             }
                         }
                         is MegaLink.File -> {
-                            val display = FilenameUtils.buildEpisodeDisplay(rowName, showFilename)
-                            val episode = SEpisode.create().apply {
-                                name = if (showFilename) "${display.name} [$quality]" else display.name
-                                url = encodeEpisodeUrl(megaHref, link.handle, rowName)
-                                episode_number = display.episodeNumber
-                            }
-                            episodes.add(episode to rowName)
+                            rawEntries.add(
+                                RawEpisodeEntry(
+                                    rawName = rowName,
+                                    quality = quality,
+                                    url = encodeEpisodeUrl(megaHref, link.handle, rowName),
+                                ),
+                            )
                         }
                     }
                 }
             }
         }
 
-        return FilenameUtils.sortByEpisodeNumberDescending(episodes) { it.second }.map { it.first }
+        return FilenameUtils.sortBySeasonAndEpisodeDescending(rawEntries, { it.rawName }, showFilename)
+            .map { seasoned ->
+                SEpisode.create().apply {
+                    name = if (showFilename) "${seasoned.display.name} [${seasoned.item.quality}]" else seasoned.display.name
+                    url = seasoned.item.url
+                    episode_number = seasoned.display.episodeNumber
+                }
+            }
     }
+
+    // Item crudo recolectado durante el parseo de la tabla, antes de
+    // resolver su nombre/número de episodio -- se necesita la lista
+    // completa para poder usar sortBySeasonAndEpisodeDescending.
+    private data class RawEpisodeEntry(
+        val rawName: String,
+        val quality: String,
+        val url: String,
+    )
 
     private fun extractResolution(qualityText: String): Int? = RESOLUTION_REGEX.find(qualityText)?.groupValues?.get(1)?.toIntOrNull()
 
@@ -496,6 +572,10 @@ class FallenSubs :
         private const val PAGE_SIZE = 30
         private const val LATEST_PAGE_SIZE = 20
         private val SECTION_HEADER_REGEX = Regex("""(DATOS DE LA SERIE|FICHA TECNICA|SINOPSIS|STAFF FALLENSUBS)""")
+
+        // "Tipo: Movie", "Tipo: Serie de TV" -- corta en el siguiente campo
+        // conocido de la ficha ("Episodios:") o fin de texto.
+        private val TIPO_REGEX = Regex("""Tipo:\s*(.+?)(?=\s*(?:Episodios|A[ñn]o|Estudio|G[eé]nero):|$)""", RegexOption.IGNORE_CASE)
         private val RESOLUTION_REGEX = Regex("""(\d{3,4})p?""")
         private val BITDEPTH_REGEX = Regex("""(\d{1,2})\s*bits?""", RegexOption.IGNORE_CASE)
 

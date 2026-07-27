@@ -238,21 +238,25 @@ class DantalianSubs :
         val document = fetchAnimePageDocument(anime)
 
         val episodes = findDriveFolderLink(document)?.let { folderUrl ->
-            gdScraper.scrapeEpisodes(folderUrl).map { ep ->
-                val display = FilenameUtils.buildEpisodeDisplay(ep.name, showFilename)
-                SEpisode.create().apply {
-                    name = display.name
-                    url = ep.url
-                    episode_number = display.episodeNumber
-                    date_upload = ep.dateUploadMillis
+            val scraped = gdScraper.scrapeEpisodes(folderUrl)
+            FilenameUtils.sortBySeasonAndEpisodeDescending(scraped, { it.name }, showFilename)
+                .map { seasoned ->
+                    SEpisode.create().apply {
+                        name = seasoned.display.name
+                        url = seasoned.item.url
+                        episode_number = seasoned.display.episodeNumber
+                        date_upload = seasoned.item.dateUploadMillis
+                    }
                 }
-            }
         } ?: parseLooseEpisodeLinks(document)
 
         if (episodes.isEmpty()) {
             throw Exception("No se encontraron episodios (ni carpeta ni links sueltos de Google Drive) para esta serie.")
         }
 
+        // sortBySeasonAndEpisodeDescending ya devuelve el camino de carpeta
+        // ordenado; se reordena aquí solo para que el camino de links
+        // sueltos (que no pasa por esa función) también quede correcto.
         val sorted = episodes.sortedByDescending { it.episode_number }
         episodesCache[anime.url] = sorted
         return sorted

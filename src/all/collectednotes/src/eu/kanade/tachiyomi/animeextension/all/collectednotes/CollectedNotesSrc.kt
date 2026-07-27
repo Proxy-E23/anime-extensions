@@ -194,7 +194,7 @@ class CollectedNotesSrc :
         val responseBody = client.newCall(GET("$baseUrl/$sitePath/$notePath.json")).execute().body.string()
         val note = json.decodeFromString<CNNoteResponse>(responseBody).note
 
-        val episodes = mutableListOf<Pair<SEpisode, String>>()
+        val episodes = mutableListOf<SEpisode>()
         val fallbackDate = runCatching {
             dateFormat.parse(note.updated_at)?.time ?: 0L
         }.getOrElse { 0L }
@@ -210,24 +210,31 @@ class CollectedNotesSrc :
             if (isFolderUrl) {
                 // Sin recursión: por ahora ningún fansub agregado usa subcarpetas.
                 val scraped = scraper.scrapeEpisodes(driveUrl, maxRecursionDepth = 1)
-                scraped.forEach { ep ->
-                    val display = FilenameUtils.buildEpisodeDisplay(ep.name, showFilename)
-                    episodes.add(
-                        SEpisode.create().apply {
-                            name = display.name
-                            url = ep.url
-                            episode_number = display.episodeNumber
-                            date_upload = ep.dateUploadMillis
-                            scanlator = ep.sizeLabel
-                        } to ep.name,
-                    )
-                }
+                FilenameUtils.sortBySeasonAndEpisodeDescending(scraped, { it.name }, showFilename)
+                    .forEach { seasoned ->
+                        episodes.add(
+                            SEpisode.create().apply {
+                                name = seasoned.display.name
+                                url = seasoned.item.url
+                                episode_number = seasoned.display.episodeNumber
+                                date_upload = seasoned.item.dateUploadMillis
+                                scanlator = seasoned.item.sizeLabel
+                            },
+                        )
+                    }
             } else {
                 val fileId = DRIVE_FILE_ID_REGEX.find(driveUrl)?.groupValues?.get(1)
                 val metadata = fileId?.let { scraper.fetchFileMetadata(it) }
 
-                val rawName = metadata?.title ?: epName
-                val display = FilenameUtils.buildEpisodeDisplay(rawName, showFilename)
+                // Se usa el texto que da el fansub en el sitio (epName) como
+                // fuente del nombre, no el nombre de archivo real de Drive
+                // -- los fansubs no siguen un patrón de nombramiento
+                // consistente en sus archivos (algunos ponen el número de
+                // episodio dentro de corchetes, otros usan ordinales en
+                // inglés dentro del título, etc.), mientras que el texto del
+                // sitio ya viene simple y confiable ("Episodio 05V2",
+                // "EPISODIO 06 v2"...).
+                val display = FilenameUtils.buildEpisodeDisplay(epName, showFilename)
                 val size = metadata?.fileSize?.let { formatBytes(it) } ?: ""
 
                 episodes.add(
@@ -237,14 +244,17 @@ class CollectedNotesSrc :
                         episode_number = display.episodeNumber
                         date_upload = metadata?.modifiedDateMillis ?: fallbackDate
                         scanlator = size
-                    } to rawName,
+                    },
                 )
             }
         }
 
         // Especiales (OP, ED, OVA...) arriba, luego episodios de mayor a menor.
-        return FilenameUtils.sortByEpisodeNumberDescending(episodes) { it.second }
-            .map { it.first }
+        // sortBySeasonAndEpisodeDescending ya ordena el camino de carpeta; se
+        // reordena aquí la lista completa para que también quede correcto el
+        // orden combinado con el camino de archivo suelto (que no pasa por
+        // esa función).
+        return episodes.sortedByDescending { it.episode_number }
     }
 
     // ============================ Video Links =============================

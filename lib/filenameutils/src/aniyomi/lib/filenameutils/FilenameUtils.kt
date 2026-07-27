@@ -33,14 +33,16 @@ object FilenameUtils {
     )
 
     // Palabras que NO son el número de episodio aunque tengan un dígito
-    // pegado (OP2, NCED, IS02, v2, x264...) -- openings/endings/insert
-    // songs, números de versión y códecs de video, no el episodio. Estas
-    // normalmente ya se limpian como parte de un tag entre paréntesis/
-    // corchetes (ej. "(x264 AAC)"), pero se filtran también aquí como red
-    // de seguridad para cuando ese tag viene con el cierre mal formado
-    // (ej. "(x264 FLAC.mkv", sin ")") y el número quedaría suelto en el título.
+    // pegado (OP2, NCED, IS02, v2, x264, 10th...) -- openings/endings/insert
+    // songs, números de versión, códecs de video y ordinales en inglés
+    // (comunes en subtítulos de título como "10th Anniversary" o "5th
+    // Season"), no el episodio. Estas normalmente ya se limpian como parte
+    // de un tag entre paréntesis/corchetes (ej. "(x264 AAC)"), pero se
+    // filtran también aquí como red de seguridad para cuando ese tag viene
+    // con el cierre mal formado (ej. "(x264 FLAC.mkv", sin ")") y el número
+    // quedaría suelto en el título.
     private val NON_EPISODE_TAG_REGEX = Regex(
-        """^[\[({]?(?:(?:nc)?(?:op|ed)\d*|isong\d*|is\d*|v\d+|[xh]26[45])$""",
+        """^[\[({]?(?:(?:nc)?(?:op|ed)\d*|isong\d*|is\d*|v\d+|[xh]26[45]|\d+(?:st|nd|rd|th))$""",
         RegexOption.IGNORE_CASE,
     )
 
@@ -331,7 +333,18 @@ object FilenameUtils {
                 // (ej. "[Grupo][Título][1080p].mkv"), la limpieza anterior
                 // deja el nombre vacío -- en ese caso se usa el nombre sin
                 // limpiar (solo sin extensión) para no mostrar un nombre en blanco.
-                cleaned.ifBlank { withoutExtension.trim() }
+                // Y si rawName YA llegaba vacío desde el origen (ej. un scraper
+                // que entregó title="" para ese archivo), withoutExtension
+                // también es vacío -- último fallback a una etiqueta genérica
+                // para no mostrar un nombre en blanco en ese caso tampoco.
+                val resolvedName = cleaned.ifBlank { withoutExtension.trim() }.ifBlank { "Episodio sin nombre" }
+                // UNKNOWN suele producir un nombre igual al título de la serie
+                // (ej. una película o especial nombrado igual que el anime,
+                // sin ningún tag ni número). Se confirmó empíricamente que
+                // algunas apps (Aniyomi/Mihon) ocultan el nombre del episodio
+                // en ese caso -- envolverlo entre corchetes evita ese
+                // comportamiento sin perder la información real del nombre.
+                "[$resolvedName]"
             }
             showFilename -> rawName
             category == EpisodeCategory.EPISODE -> "Episodio ${number?.let { formatEpisodeNumber(it) } ?: "?"}"
@@ -460,7 +473,46 @@ object FilenameUtils {
         return withUnknownFixed.sortedWith(
             compareBy<SeasonedEpisode<T>> { detectCategory(nameSelector(it.item)).sortPriority }
                 .thenBy { detectCategory(nameSelector(it.item)) == EpisodeCategory.EXTRA }
-                .thenByDescending { it.display.episodeNumber },
+                .thenByDescending { seasoned ->
+                    // No se puede usar seasoned.display.episodeNumber para
+                    // este ni los pasos siguientes: buildEpisodeDisplay
+                    // asigna 0F a TODA categoría especial sin número real,
+                    // así que no distingue "ED" (sin número) de "ED2" (con
+                    // número) -- ambos quedarían en 0F y perderían el orden
+                    // entre sí. Se recalcula el número real de la misma
+                    // forma que sortByEpisodeNumberDescending: EPISODE busca
+                    // en cualquier parte del nombre, el resto busca el
+                    // número pegado al tag.
+                    val name = nameSelector(seasoned.item)
+                    val category = detectCategory(name)
+                    val number = if (category == EpisodeCategory.EPISODE) {
+                        extractEpisodeNumber(name)
+                    } else {
+                        extractTrailingNumber(name)
+                    }
+                    category == EpisodeCategory.EPISODE && number == null
+                }
+                .thenByDescending { seasoned ->
+                    val name = nameSelector(seasoned.item)
+                    val category = detectCategory(name)
+                    val number = if (category == EpisodeCategory.EPISODE) {
+                        extractEpisodeNumber(name)
+                    } else {
+                        extractTrailingNumber(name)
+                    }
+                    // Sin número, se trata como el valor más bajo dentro de
+                    // los que sí tienen número (ej. "OP2" antes que "OP").
+                    // -1 en vez de NEGATIVE_INFINITY para no quedar detrás
+                    // de categorías (como EXTRA) que puedan tener números
+                    // negativos válidos. Para EPISODE con offset de
+                    // temporada, se usa display.episodeNumber (que ya
+                    // incluye ese offset) en vez del número crudo.
+                    if (category == EpisodeCategory.EPISODE && number != null) {
+                        seasoned.display.episodeNumber
+                    } else {
+                        number ?: -1F
+                    }
+                },
         )
     }
 
