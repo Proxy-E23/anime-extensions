@@ -1,7 +1,7 @@
 ext {
     extName = 'Wing Zero Plus'
     extClass = '.WingZeroPlus'
-    extVersionCode = 9
+    extVersionCode = 10
 }
 
 apply plugin: "kei.plugins.extension.legacy"
