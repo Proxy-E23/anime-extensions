@@ -11,17 +11,23 @@ import org.nanohttpd.protocols.http.response.Status
 import java.io.PipedInputStream
 import java.io.PipedOutputStream
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ConcurrentLinkedDeque
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 /**
- * Servidor HTTP local (127.0.0.1) que actúa de puente entre ExoPlayer y los
- * servidores de descarga de MEGA. MEGA nunca entrega contenido en claro: el
- * proxy pide los bytes cifrados, los descifra en AES-CTR respetando el
+ * Servidor HTTP local (127.0.0.1) que actúa de puente entre el reproductor y
+ * los servidores de descarga de MEGA. MEGA nunca entrega contenido en claro:
+ * el proxy pide los bytes cifrados, los descifra en AES-CTR respetando el
  * offset exacto pedido, y responde como un servidor HTTP normal con soporte
  * de `Range`, que es indispensable para que el reproductor pueda hacer seek.
  *
  * Una instancia de este servidor puede servir múltiples streams a la vez;
  * cada uno se registra con [registerStream] y obtiene una URL local propia.
+ *
+ * No se auto-apaga por inactividad: el costo de dejarlo corriendo es
+ * mínimo, y cualquier heurística basada en tráfico podría cortar una
+ * reproducción real en curso. Se detiene solo con [MegaExtractor.shutdown].
  */
 internal class MegaProxyServer(
     private val client: OkHttpClient,
@@ -44,12 +50,29 @@ internal class MegaProxyServer(
     val localPort: Int
         get() = super.getListeningPort()
 
+    // Orden de registro de streamId vivos. Nadie llama unregisterStream hoy,
+    // así que sin este límite `streams` crecería para siempre. Se asume que
+    // solo hay un episodio activo a la vez, salvo un margen chico para
+    // cubrir el caso de pedir dos calidades casi seguidas del mismo episodio.
+    private val registrationOrder = ConcurrentLinkedDeque<String>()
+    private val maxRecentStreams = 2
+
+    @Synchronized
     fun registerStream(streamId: String, info: StreamInfo) {
         streams[streamId] = info
+        registrationOrder.remove(streamId) // evita duplicar si se re-registra el mismo id
+        registrationOrder.addLast(streamId)
+
+        while (registrationOrder.size > maxRecentStreams) {
+            val oldest = registrationOrder.pollFirst() ?: break
+            streams.remove(oldest)
+        }
     }
 
+    @Synchronized
     fun unregisterStream(streamId: String) {
         streams.remove(streamId)
+        registrationOrder.remove(streamId)
     }
 
     fun urlFor(streamId: String): String = "http://127.0.0.1:$localPort/stream/$streamId"
@@ -106,6 +129,17 @@ internal class MegaProxyServer(
         return start to end.coerceAtMost(totalSize - 1)
     }
 
+    // Cliente con timeouts propios para pedir el rango a MEGA: sin esto, si
+    // MEGA acepta la conexión pero no responde nada, la llamada podría
+    // quedarse colgada varios minutos en vez de fallar rápido. callTimeout
+    // solo cubre hasta recibir los headers, no la descarga completa del
+    // cuerpo (esa va aparte, vía streaming, en decryptStreamInto).
+    private val rangeClient = client.newBuilder()
+        .connectTimeout(10, TimeUnit.SECONDS)
+        .readTimeout(15, TimeUnit.SECONDS)
+        .callTimeout(20, TimeUnit.SECONDS)
+        .build()
+
     /**
      * Sirve el rango [start, end] (inclusive) descifrado.
      *
@@ -126,10 +160,27 @@ internal class MegaProxyServer(
             .header("Range", "bytes=$alignedStart-$end")
             .build()
 
-        val upstreamResponse = client.newCall(upstreamRequest).execute()
+        val upstreamResponse = try {
+            rangeClient.newCall(upstreamRequest).execute()
+        } catch (e: java.io.IOException) {
+            // Timeout o fallo de red hablando con el servidor de MEGA (no
+            // con nuestro propio proxy).
+            Log.e(tag, "Timeout/fallo de red pidiendo bytes=$alignedStart-$end a MEGA: ${e.message}", e)
+            return newFixedLengthResponse(
+                Status.SERVICE_UNAVAILABLE,
+                "text/plain",
+                "No se pudo contactar al servidor de MEGA: ${e.message}",
+            )
+        }
         if (!upstreamResponse.isSuccessful) {
             val upstreamCode = upstreamResponse.code
+            val upstreamBody = runCatching { upstreamResponse.body.string() }.getOrNull()
             upstreamResponse.close()
+            Log.e(
+                tag,
+                "MEGA respondió $upstreamCode al pedir bytes=$alignedStart-$end de " +
+                    "${info.downloadUrl.substringBefore('?')}. Body: $upstreamBody",
+            )
             return newFixedLengthResponse(
                 Status.SERVICE_UNAVAILABLE,
                 "text/plain",
@@ -154,6 +205,15 @@ internal class MegaProxyServer(
                     trimFront = trimFront,
                     totalPlainBytesToEmit = requestedLength,
                 )
+            } catch (e: java.io.IOException) {
+                if (e.message == "Pipe closed") {
+                    // Normal cuando MPV corta la conexión a mitad de un
+                    // rango (buffer suficiente, o hizo seek). No es un fallo
+                    // real; el finally de abajo igual cierra todo.
+                    Log.d(tag, "Stream cortado por el lector antes de terminar (normal en seeks)")
+                } else {
+                    Log.e(tag, "Error de I/O descifrando stream: ${e.message}", e)
+                }
             } catch (e: Exception) {
                 Log.e(tag, "Error descifrando stream: ${e.message}", e)
             } finally {

@@ -1,9 +1,9 @@
 package eu.kanade.tachiyomi.animeextension.all.meganz
 
 import android.content.SharedPreferences
+import android.widget.Toast
 import androidx.preference.EditTextPreference
 import androidx.preference.PreferenceScreen
-import androidx.preference.SwitchPreferenceCompat
 import aniyomi.lib.filenameutils.FilenameUtils
 import aniyomi.lib.megaextractor.MegaExtractor
 import aniyomi.lib.megaextractor.MegaLink
@@ -16,6 +16,7 @@ import eu.kanade.tachiyomi.animesource.model.SEpisode
 import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.animesource.online.AnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
+import keiyoushi.utils.addSwitchPreference
 import keiyoushi.utils.getPreferencesLazy
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -371,11 +372,41 @@ class Mega :
     // ── Preferencias ──────────────────────────────────────────────────────────
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
-        SwitchPreferenceCompat(screen.context).apply {
-            key = MegaPreferences.PREF_SHOW_FILENAME
-            title = "Mostrar nombre del archivo"
-            summary = "Activado: muestra el nombre real del archivo.\nDesactivado: muestra \"Episodio 1\", \"Episodio 2\"…"
-            setDefaultValue(false)
+        screen.addSwitchPreference(
+            key = MegaPreferences.PREF_SHOW_FILENAME,
+            default = false,
+            title = "Mostrar nombre del archivo",
+            summary = "Activado: muestra el nombre real del archivo.\nDesactivado: muestra \"Episodio 1\", \"Episodio 2\"…",
+        )
+
+        EditTextPreference(screen.context).apply {
+            // key dummy: no se persiste nada real, pero EditTextPreference
+            // la requiere no-nula.
+            key = "meganz_stop_proxy_button"
+            title = "Detener servidor de MEGA"
+            summary = "El servidor local que descifra y sirve los videos de MEGA se queda " +
+                "corriendo en segundo plano mientras la app esté abierta (el costo de " +
+                "dejarlo así es mínimo). Si prefieres apagarlo manualmente en vez de " +
+                "esperar a cerrar la app, toca aquí. Si estás reproduciendo algo ahora " +
+                "mismo, se cortará."
+            setDialogTitle("Detener servidor de MEGA")
+            setDialogMessage(
+                "El cuadro de texto no se usa: toca Aceptar para detener el servidor " +
+                    "ahora, o Cancelar para no hacer nada.",
+            )
+            // Se reutiliza EditTextPreference como confirmación
+            // (Aceptar/Cancelar); el texto tecleado se ignora.
+            // onPreferenceChangeListener solo dispara con Aceptar, y
+            // retorna false para no persistir nada.
+            setOnPreferenceChangeListener { _, _ ->
+                extractor.shutdown()
+                Toast.makeText(
+                    screen.context,
+                    "Servidor de MEGA detenido.",
+                    Toast.LENGTH_SHORT,
+                ).show()
+                false
+            }
         }.also(screen::addPreference)
 
         val folderListPref = EditTextPreference(screen.context).apply {
