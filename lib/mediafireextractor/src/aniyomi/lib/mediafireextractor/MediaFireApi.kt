@@ -1,5 +1,6 @@
 package aniyomi.lib.mediafireextractor
 
+import android.util.Log
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.util.asJsoup
 import kotlinx.serialization.json.Json
@@ -7,6 +8,10 @@ import okhttp3.Headers
 import okhttp3.OkHttpClient
 
 internal class MediaFireApi(private val client: OkHttpClient, private val baseUrl: String) {
+
+    companion object {
+        private const val TAG = "MediaFireApi"
+    }
 
     private val json = Json {
         ignoreUnknownKeys = true
@@ -79,29 +84,65 @@ internal class MediaFireApi(private val client: OkHttpClient, private val baseUr
         null
     }
 
+    /**
+     * A veces MediaFire devuelve `normal_download` envuelto en sintaxis
+     * markdown, p.ej. `https://[host/path](https://host/path)`, en vez de
+     * una URL limpia. Si detectamos ese patrón, extraemos la URL real de
+     * dentro de los paréntesis en vez de descartar el campo.
+     */
+    private fun sanitizeDownloadUrl(raw: String): String? {
+        val markdownMatch = Regex("""\((https?://[^)]+)\)""").find(raw)
+        if (markdownMatch != null) {
+            Log.w(TAG, "normal_download vino envuelto en markdown, se extrajo la URL interna")
+            return markdownMatch.groupValues[1]
+        }
+        return raw.takeIf { it.startsWith("http://") || it.startsWith("https://") }
+    }
+
     fun fetchNormalDownloadLink(quickkey: String, browserHeaders: Headers): String? = try {
         val apiUrl = "$baseUrl/api/1.5/file/get_links.php" +
             "?quick_key=$quickkey&link_type=normal_download&response_format=json"
         val body = client.newCall(GET(apiUrl, browserHeaders)).execute().body.string()
-        json.decodeFromString<MediaFireLinksRoot>(body)
+        val rawUrl = json.decodeFromString<MediaFireLinksRoot>(body)
             .response.links?.firstOrNull()?.normal_download
             ?.takeIf { it.isNotBlank() }
+        Log.d(TAG, "fetchNormalDownloadLink quickkey=$quickkey rawUrl=$rawUrl")
+        rawUrl?.let(::sanitizeDownloadUrl)
     } catch (e: Exception) {
+        Log.e(TAG, "fetchNormalDownloadLink falló para quickkey=$quickkey: ${e.javaClass.simpleName}: ${e.message}")
         null
     }
 
-    fun followRedirectLocation(url: String, browserHeaders: Headers): String? {
-        val noRedirectClient = client.newBuilder().followRedirects(false).build()
-        val resp = noRedirectClient.newCall(GET(url, browserHeaders)).execute()
+    // Cliente aislado (no hereda el `client` de la app) usado solo para
+    // verificar el link de la API contra mediafire.com. No se usa contra los
+    // hosts downloadXXXX.mediafire.com: en algunos dispositivos el handshake
+    // TLS con esos hosts falla del lado del sistema, así que esa verificación
+    // se evita en resolveDirectVideoUrl y se confía directo en el href del
+    // botón de descarga.
+    private val plainRedirectClient by lazy {
+        OkHttpClient.Builder()
+            .followRedirects(false)
+            .build()
+    }
+
+    fun followRedirectLocation(url: String, browserHeaders: Headers): String? = try {
+        val resp = plainRedirectClient.newCall(GET(url, browserHeaders)).execute()
         val location = resp.header("Location")
+        Log.d(TAG, "followRedirectLocation url=$url code=${resp.code} location=$location")
         resp.close()
-        return location
+        location
+    } catch (e: Exception) {
+        Log.e(TAG, "followRedirectLocation falló para url=$url: ${e.javaClass.simpleName}: ${e.message}")
+        throw e
     }
 
     fun fetchDownloadButtonHref(pageUrl: String, browserHeaders: Headers): String? = try {
         val document = client.newCall(GET(pageUrl, browserHeaders)).execute().use { it.asJsoup() }
-        document.selectFirst("a#downloadButton")?.attr("abs:href")?.takeIf { it.isNotBlank() }
+        val href = document.selectFirst("a#downloadButton")?.attr("abs:href")?.takeIf { it.isNotBlank() }
+        Log.d(TAG, "fetchDownloadButtonHref pageUrl=$pageUrl href=$href")
+        href
     } catch (e: Exception) {
+        Log.e(TAG, "fetchDownloadButtonHref falló para pageUrl=$pageUrl: ${e.javaClass.simpleName}: ${e.message}")
         null
     }
 }

@@ -1,5 +1,6 @@
 package aniyomi.lib.mediafireextractor
 
+import android.util.Log
 import eu.kanade.tachiyomi.animesource.model.Video
 import okhttp3.Headers
 import okhttp3.OkHttpClient
@@ -22,6 +23,10 @@ class MediaFireExtractor(
 ) {
 
     private val api = MediaFireApi(client, baseUrl)
+
+    companion object {
+        private const val TAG = "MediaFireExtractor"
+    }
 
     // ── Parseo y metadatos ──────────────────────────────────────────────────
 
@@ -52,19 +57,29 @@ class MediaFireExtractor(
      * escanear el botón de descarga en la página del archivo.
      */
     fun resolveDirectVideoUrl(quickkey: String, filename: String): String {
-        val normalUrl = runCatching { api.fetchNormalDownloadLink(quickkey, browserHeaders) }.getOrNull()
+        val normalUrl = runCatching { api.fetchNormalDownloadLink(quickkey, browserHeaders) }
+            .onFailure { Log.e(TAG, "resolveDirectVideoUrl: fetchNormalDownloadLink lanzó excepción: ${it.javaClass.simpleName}: ${it.message}") }
+            .getOrNull()
         if (normalUrl != null) {
-            val location = runCatching { api.followRedirectLocation(normalUrl, browserHeaders) }.getOrNull()
-            if (!location.isNullOrBlank() && "download" in location) return location
+            val location = runCatching { api.followRedirectLocation(normalUrl, browserHeaders) }
+                .onFailure { Log.e(TAG, "resolveDirectVideoUrl: followRedirectLocation(normalUrl) lanzó excepción: ${it.javaClass.simpleName}: ${it.message}") }
+                .getOrNull()
+            if (!location.isNullOrBlank() && "download" in location) {
+                Log.d(TAG, "resolveDirectVideoUrl: resuelto vía API directa -> $location")
+                return location
+            }
         }
 
+        // btnHref ya es el link final de descarga (responde 200 sin header
+        // Location), así que no se verifica con una petición extra: en
+        // algunos dispositivos el handshake TLS contra downloadXXXX.mediafire.com
+        // falla del lado del sistema aunque el certificado sea válido.
         val encodedFilename = java.net.URLEncoder.encode(filename, "UTF-8").replace("+", "%20")
         val pageUrl = "$baseUrl/file/$quickkey/$encodedFilename"
-        return runCatching {
-            val btnHref = api.fetchDownloadButtonHref(pageUrl, browserHeaders) ?: return@runCatching pageUrl
-            val location = api.followRedirectLocation(btnHref, browserHeaders)
-            if (!location.isNullOrBlank() && "download" in location) location else btnHref
-        }.getOrDefault(pageUrl)
+        val result = api.fetchDownloadButtonHref(pageUrl, browserHeaders) ?: pageUrl
+
+        Log.d(TAG, "resolveDirectVideoUrl: resuelto vía fallback de botón -> $result")
+        return result
     }
 
     /**
