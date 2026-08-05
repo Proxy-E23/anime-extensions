@@ -70,16 +70,46 @@ class MediaFireExtractor(
             }
         }
 
-        // btnHref ya es el link final de descarga (responde 200 sin header
-        // Location), así que no se verifica con una petición extra: en
-        // algunos dispositivos el handshake TLS contra downloadXXXX.mediafire.com
-        // falla del lado del sistema aunque el certificado sea válido.
         val encodedFilename = java.net.URLEncoder.encode(filename, "UTF-8").replace("+", "%20")
         val pageUrl = "$baseUrl/file/$quickkey/$encodedFilename"
-        val result = api.fetchDownloadButtonHref(pageUrl, browserHeaders) ?: pageUrl
+        val btnHref = api.fetchDownloadButtonHref(pageUrl, browserHeaders) ?: run {
+            Log.w(TAG, "resolveDirectVideoUrl: botón de descarga no encontrado en pageUrl=$pageUrl, devolviendo pageUrl")
+            return pageUrl
+        }
+
+        // El btnHref puede venir en dos formas:
+        //   1) URL final al CDN: https://downloadXXXX.mediafire.com/...mp4
+        //      No se verifica con una petición extra: en algunos dispositivos
+        //      el handshake TLS contra ese host falla del lado del sistema
+        //      aunque el certificado sea válido, así que se confía tal cual.
+        //   2) URL intermedia con dkey: https://www.mediafire.com/file/...?dkey=...&r=...
+        //      Esta página NO redirige por HTTP (no manda header Location):
+        //      entrega el link final del CDN dentro de un <script> vía
+        //      `window.location.href = '...'`. Hay que leer ese script.
+        val result = if (needsRedirectResolution(btnHref)) {
+            val scriptUrl = runCatching { api.fetchScriptRedirectUrl(btnHref, browserHeaders) }
+                .onFailure { Log.e(TAG, "resolveDirectVideoUrl: fetchScriptRedirectUrl(btnHref) lanzó excepción: ${it.javaClass.simpleName}: ${it.message}") }
+                .getOrNull()
+            if (!scriptUrl.isNullOrBlank()) scriptUrl else btnHref
+        } else {
+            btnHref
+        }
 
         Log.d(TAG, "resolveDirectVideoUrl: resuelto vía fallback de botón -> $result")
         return result
+    }
+
+    /**
+     * true si [href] necesita un paso extra de resolución de redirect
+     * (apunta a una página intermedia con `dkey` en vez de al CDN directo).
+     */
+    private fun needsRedirectResolution(href: String): Boolean {
+        // CDN directo: host empieza con "download" (downloadXXXX.mediafire.com)
+        if (href.contains("://download") && "mediafire.com" in href) return false
+        // Página intermedia: contiene /file/ y dkey=
+        if ("/file/" in href && "dkey=" in href) return true
+        // Default conservador: si no reconocemos el patrón, no seguimos.
+        return false
     }
 
     /**

@@ -145,4 +145,22 @@ internal class MediaFireApi(private val client: OkHttpClient, private val baseUr
         Log.e(TAG, "fetchDownloadButtonHref falló para pageUrl=$pageUrl: ${e.javaClass.simpleName}: ${e.message}")
         null
     }
+
+    // La página intermedia con ?dkey=...&r=... NO redirige por HTTP: entrega
+    // el link final del CDN dentro de un <script> mediante
+    //   setTimeout(function () { window.location.href = '...'; }, 1000);
+    // Jsoup no ejecuta JS, así que hay que extraer la URL del propio HTML con
+    // una expresión regular en vez de esperar un header Location.
+    private val cdnRedirectScriptRegex =
+        Regex("""window\.location\.href\s*=\s*'(https?://[^']+)'""")
+
+    fun fetchScriptRedirectUrl(url: String, browserHeaders: Headers): String? = try {
+        val body = client.newCall(GET(url, browserHeaders)).execute().use { it.body.string() }
+        val redirectUrl = cdnRedirectScriptRegex.find(body)?.groupValues?.get(1)
+        Log.d(TAG, "fetchScriptRedirectUrl url=$url redirectUrl=$redirectUrl")
+        redirectUrl
+    } catch (e: Exception) {
+        Log.e(TAG, "fetchScriptRedirectUrl falló para url=$url: ${e.javaClass.simpleName}: ${e.message}")
+        null
+    }
 }
