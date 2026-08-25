@@ -96,56 +96,45 @@ internal class MegaApi(private val client: OkHttpClient) {
         val rawNodes = folderResponse.f ?: emptyList()
         Log.d(tag, "listFolder($folderHandle): ${rawNodes.size} nodos crudos recibidos")
 
-        // handle -> master key (16 bytes) de cada carpeta ya resuelta, para
-        // poder descifrar hijos anidados. Se pre-puebla con el propio handle
-        // de la carpeta raíz: la mayoría de los nodos de primer nivel tienen
-        // "p" (parent) apuntando exactamente a ese handle, así que sin esta
-        // entrada nunca se encontraba su key y fallaban en cascada (bug real
-        // detectado: solo el nodo cuyo padre coincidía por otra vía resolvía
-        // bien, el resto caía silenciosamente a "sin key resoluble").
-        val folderKeys = mutableMapOf(folderHandle to folderKeyRaw)
-
         val nodes = mutableListOf<MegaNode>()
 
         // El primer nodo que devuelve la API para un link de carpeta pública
         // es siempre el nodo raíz de esa carpeta (confirmado contra datos
         // reales: p.ej. para el link .../folder/WkdXGIyb#..., el primer nodo
         // trae h="Px0wVRIB" — un handle distinto de "WkdXGIyb", el del link).
-        // Se necesita esta bandera explícita para el bug de abajo.
         var rootNodeHandle: String? = null
 
-        // Se resuelve la key de cada nodo en el orden en que llega. Esto
-        // asume que la API devuelve los nodos en orden topológico (carpetas
-        // padre antes que sus hijos), que es el comportamiento observado del
-        // protocolo. Si algún nodo llegara antes que su padre, simplemente
-        // no se podrá descifrar su nombre (queda como "(sin nombre)") en vez
-        // de romper el resto del listado.
+        // FIX REAL (reemplaza el intento anterior de "cascada de keys por
+        // padre"), confirmado línea por línea contra Node::applykey() del
+        // SDK oficial de MEGA (node.cpp) y verificado con datos reales de la
+        // API para la carpeta "Dr. Stone" (8 nodos, carpetas y archivos, 3
+        // niveles de profundidad, todos con compound key de 3-5 pares):
+        //
+        // El protocolo NO descifra la nodekey de un hijo con la nodekey ya
+        // descifrada de su padre inmediato (eso es lo que hacía la versión
+        // anterior, y por eso fallaba: no existe tal cascada). En vez de
+        // eso, cada nodo trae en su campo "k" un compound key con un par
+        // "handle:blob" por cada nivel de ancestro hasta la raíz del árbol
+        // devuelto, y el par que hay que usar es el que tiene como handle el
+        // handle del NODO RAÍZ DEL ÁRBOL (rootNodeHandle, el primer nodo que
+        // devuelve listFolder) — no el handle del link de la URL, y no el
+        // del padre directo ("p") salvo que este coincida con la raíz. Ese
+        // blob se descifra SIEMPRE con folderKeyRaw (la master key del
+        // link), sin importar cuán profundo esté el nodo en el árbol.
+        //
+        // Esto coincide con MegaClient::folderaccess() (megaclient.cpp):
+        // `key.setkey(folderkey)` deja la master key del cliente fija e
+        // igual a la del link para toda la sesión de acceso al folder link,
+        // y Node::applykey() (node.cpp) siempre usa esa misma key salvo que
+        // el handle matcheado corresponda a un share ajeno con su propio
+        // sharekey (mNewKeyRepository/n->sharekey) — caso que no aplica a
+        // los nodos internos de un mismo folder link público.
         for (raw in rawNodes) {
-            val parentFolderKey = raw.p?.let { folderKeys[it] } ?: folderKeyRaw
-            val nodeKeyRaw = raw.k?.let { decryptNodeKey(it, parentFolderKey, raw.p) }
             if (rootNodeHandle == null) rootNodeHandle = raw.h
+            val nodeKeyRaw = raw.k?.let { decryptNodeKey(it, folderKeyRaw, rootNodeHandle) }
 
             val (fileKeyMaterial, folderMasterKey) = when {
                 raw.t == 1 && nodeKeyRaw != null && nodeKeyRaw.size == 16 -> {
-                    // BUG REAL (confirmado con datos reales de la API, carpeta
-                    // "Ragna Crimson"): para descifrar a los HIJOS del nodo
-                    // raíz de la carpeta compartida, la master key correcta
-                    // es folderKeyRaw (la key del propio link, tal cual), NO
-                    // el nodekey que resulta de descifrar el campo "k" del
-                    // nodo raíz — ese nodekey solo sirve para el atributo "a"
-                    // del root mismo, y si se propaga a los hijos, todos sus
-                    // atributos descifran a basura silenciosamente.
-                    //
-                    // Por eso el nodo raíz (raw.h == rootNodeHandle) NO debe
-                    // agregar una entrada a folderKeys: sus hijos (cuyo "p"
-                    // es raw.h) no la encontrarán ahí y caerán al fallback
-                    // `?: folderKeyRaw` de la línea de arriba, que es la key
-                    // correcta. Solo las sub-carpetas reales más profundas
-                    // (t=1 que no son el root) sí deben registrar su propio
-                    // nodekey para que sus hijos lo usen.
-                    if (raw.h != rootNodeHandle) {
-                        folderKeys[raw.h] = nodeKeyRaw
-                    }
                     null to nodeKeyRaw
                 }
                 raw.t == 0 && nodeKeyRaw != null && nodeKeyRaw.size == 32 -> {
@@ -244,38 +233,38 @@ internal class MegaApi(private val client: OkHttpClient) {
     }
 
     /**
-     * Descifra la node key de un nodo. El campo "k" viene como
-     * "handleDelPropioNodo:blobCifrado", donde el blob está cifrado con la
-     * key de la carpeta *padre* (la del propio nodo aún no existe hasta
-     * descifrar esto). A veces trae varios pares separados por "/" cuando el
-     * nodo fue compartido con múltiples usuarios; en ese caso alcanza con
-     * encontrar el primer par que se logre descifrar con la key del padre.
+     * Descifra la node key de un nodo dentro de un folder link público.
+     *
+     * El campo "k" trae uno o más pares "handle:blobCifrado" separados por
+     * "/" — uno por cada nivel de ancestro compartido entre el nodo y la
+     * raíz del árbol devuelto. NO es una cascada donde cada nivel se
+     * descifra con la key del nivel anterior: confirmado línea por línea
+     * contra Node::applykey() del SDK oficial (node.cpp) y verificado con
+     * datos reales de la API (carpeta "Dr. Stone": 8 nodos, carpetas y
+     * archivos, hasta 3 niveles de profundidad, compound keys de 1 a 5
+     * pares) que el par correcto es siempre el que tiene como handle el
+     * handle del NODO RAÍZ del árbol (rootNodeHandle, el primer nodo que
+     * devuelve listFolder), y ese blob se descifra SIEMPRE con la master
+     * key del propio link (folderKeyRaw) — nunca con la key de un padre
+     * intermedio, sin importar cuán profundo esté el nodo.
+     *
+     * Esto coincide con MegaClient::folderaccess() (megaclient.cpp), que
+     * fija `client->key` a la key del link para toda la sesión, y con
+     * Node::applykey(), que siempre descifra contra esa misma key salvo
+     * que el handle matcheado sea el de un share ajeno con su propio
+     * sharekey — caso que no aplica entre nodos de un mismo folder link.
+     *
+     * Si el compound key no trae ningún par con el handle raíz (no
+     * debería pasar en la práctica), se cae a probar todos los pares en
+     * orden como último recurso.
      */
-    // BUG REAL (confirmado con datos reales de la API, carpeta "Rakudai
-    // Kishi no Cavalry", episodio 05): el campo "k" de un nodo puede traer
-    // MÁS DE UN PAR "handle:key" separados por "/" cuando el archivo tiene
-    // keys asociadas a más de un contexto/carpeta (p.ej. fue movido o
-    // comparte permisos con otra carpeta). Ejemplo real:
-    //   "5BpV3J6L:2QOv...buA/tdoTBbyA:xd1o...VAM"
-    // La versión anterior probaba los pares EN ORDEN y se quedaba con el
-    // primero que no lanzara excepción al descifrar -- pero descifrar con
-    // la key equivocada (la de "5BpV3J6L", que no es el handle del padre
-    // real de este nodo) NO siempre lanza excepción: el AES-ECB igual
-    // produce 16 o 32 bytes válidos, solo que son basura. Eso hacía que el
-    // nombre del archivo nunca se recuperara para ese nodo puntual, aunque
-    // los datos SÍ estaban completos y correctos en la respuesta de la API.
-    //
-    // El fix: usar el handle que antecede a los ":" para elegir el par que
-    // corresponde al padre real (parentHandle) conocido por el llamador. Si
-    // ningún par calza con ese handle (no debería pasar en la práctica, pero
-    // por si acaso), se cae al comportamiento anterior como último recurso.
-    private fun decryptNodeKey(kField: String, parentFolderKey: ByteArray, parentHandle: String? = null): ByteArray? {
+    private fun decryptNodeKey(kField: String, folderKeyRaw: ByteArray, rootNodeHandle: String? = null): ByteArray? {
         val pairs = kField.split("/").mapNotNull { pair ->
             val idx = pair.indexOf(":")
             if (idx == -1) null else pair.substring(0, idx) to pair.substring(idx + 1)
         }
 
-        val matchingPair = parentHandle?.let { h -> pairs.firstOrNull { it.first == h } }
+        val matchingPair = rootNodeHandle?.let { h -> pairs.firstOrNull { it.first == h } }
         val orderedBlobs = if (matchingPair != null) {
             listOf(matchingPair.second) + pairs.filter { it != matchingPair }.map { it.second }
         } else {
@@ -285,7 +274,7 @@ internal class MegaApi(private val client: OkHttpClient) {
         for (blob in orderedBlobs) {
             val decrypted = try {
                 val cipherBytes = MegaCrypto.megaBase64Decode(blob)
-                MegaCrypto.aesEcbDecrypt(parentFolderKey, cipherBytes)
+                MegaCrypto.aesEcbDecrypt(folderKeyRaw, cipherBytes)
             } catch (e: Exception) {
                 null
             }
