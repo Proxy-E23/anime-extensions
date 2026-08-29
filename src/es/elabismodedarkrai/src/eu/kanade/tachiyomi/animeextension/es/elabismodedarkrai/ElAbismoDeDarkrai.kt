@@ -16,6 +16,9 @@ import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.utils.addSwitchPreference
 import keiyoushi.utils.getPreferencesLazy
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.nodes.Document
@@ -23,6 +26,7 @@ import org.jsoup.nodes.Element
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
 import java.net.URLDecoder
+import java.util.Collections
 
 class ElAbismoDeDarkrai :
     ParsedAnimeHttpSource(),
@@ -73,6 +77,14 @@ class ElAbismoDeDarkrai :
         Category("Eventos especiales", "eventos-especiales"),
     )
 
+    // Un href interno que apunta al slug de una de las categorías de arriba
+    // (ej. "/view/elabismodedarkrai/recuerdos-manga") no es una serie con
+    // sub-páginas, es un link cruzado a otra categoría completa del sitio.
+    private fun isCategoryLink(href: String): Boolean {
+        val slug = href.substringAfterLast('/').substringBefore('?')
+        return categories.any { it.path == slug }
+    }
+
     // ============================== Popular ================================
     // Dos niveles de caché, igual que en el resto de tus extensiones:
     // - Sesión (en memoria, categoryCache/allCategoriesCache): vive mientras el
@@ -85,7 +97,11 @@ class ElAbismoDeDarkrai :
     //   (sesión nueva).
     // Populares combina las 6 categorías en una sola lista; el filtro de
     // categoría solo acota en Buscar.
-    private val categoryCache = mutableMapOf<String, List<SAnime>>()
+    // synchronizedMap: getPopularAnime ahora dispara las 6 categorías en
+    // paralelo, así que puede haber escrituras concurrentes sobre este mapa
+    // (cada corrutina usa su propia key, pero un HashMap plano no garantiza
+    // integridad interna con escrituras simultáneas).
+    private val categoryCache = Collections.synchronizedMap(mutableMapOf<String, List<SAnime>>())
     private var allCategoriesCache: List<SAnime>? = null
 
     private fun currentCategoryPath(filters: AnimeFilterList): String? {
@@ -98,14 +114,15 @@ class ElAbismoDeDarkrai :
     override suspend fun getPopularAnime(page: Int): AnimesPage {
         allCategoriesCache?.let { return AnimesPage(it, false) }
 
-        val combined = mutableListOf<SAnime>()
-        categories.forEach { category ->
-            val entries = getAnimeForCategory(category.path).animes
-            combined.addAll(
-                entries.map { anime ->
-                    anime.apply { description = "Categoría: ${category.label}" }
-                },
-            )
+        // Las 6 categorías son requests independientes entre sí, así que se
+        // piden todas en paralelo en vez de una por una: el tiempo total pasa
+        // a ser el de la más lenta de las 6, no la suma de las 6.
+        val combined = coroutineScope {
+            categories.map { category ->
+                async { category to getAnimeForCategory(category.path).animes }
+            }.awaitAll().flatMap { (category, entries) ->
+                entries.map { anime -> anime.apply { description = "Categoría: ${category.label}" } }
+            }
         }
         allCategoriesCache = combined
         return AnimesPage(combined, false)
@@ -152,7 +169,13 @@ class ElAbismoDeDarkrai :
                 href.isNullOrBlank() -> return@forEach
                 // Sub-página interna del propio sitio (una serie con varios enlaces
                 // de descarga adentro, ej. temporadas): se resuelve aparte.
-                href.startsWith("/view/") || href.contains("sites.google.com/view/elabismodedarkrai") -> {
+                // Se excluyen los slugs de las propias categorías (recuerdos-anime,
+                // recuerdos-manga, etc.): a veces aparecen como link cruzado dentro
+                // de otra categoría, y no son una serie sino la categoría completa;
+                // tratarlas como sub-página anteponía "recuerdos manga - " a cada
+                // card de esa categoría (ej. "recuerdos manga - Sousou no Frieren").
+                (href.startsWith("/view/") || href.contains("sites.google.com/view/elabismodedarkrai")) &&
+                    !isCategoryLink(href) -> {
                     subPages.add(href)
                 }
                 // Card con el redirect de Google envolviendo un link de MEGA directo.
@@ -209,13 +232,27 @@ class ElAbismoDeDarkrai :
 
             entries.add(
                 SAnime.create().apply {
-                    title = listOfNotNull(parentTitle, titleText).joinToString(" - ").ifBlank { titleText ?: "Sin título" }
+                    title = buildEntryTitle(parentTitle, titleText)
                     thumbnail_url = liveThumbnail ?: getCachedThumbnail(megaUrl)
                     url = megaUrl
                 },
             )
         }
         return entries
+    }
+
+    // El nombre de la sub-página (parentTitle, sacado del slug/<title> de Google
+    // Sites) suele ser una versión corta o informal del nombre real de la serie
+    // (ej. "spy" para "SPY X FAMILY", "shingeki" para "Shingeki no Kyojin"). Si
+    // el título de la card ya lo contiene, anteponerlo es puro ruido repetido
+    // ("spy - SPY X FAMILY S1"), así que se omite en ese caso.
+    private fun buildEntryTitle(parentTitle: String?, cardTitle: String?): String {
+        val card = cardTitle?.ifBlank { null }
+        val parent = parentTitle?.ifBlank { null }
+        if (parent == null) return card ?: "Sin título"
+        if (card == null) return parent
+        if (card.contains(parent, ignoreCase = true)) return card
+        return "$parent - $card"
     }
 
     // El sitio enlaza vía https://www.google.com/url?q=<url-encoded>&sa=D&... en
