@@ -1,7 +1,7 @@
 ext {
     extName = 'FallenSubs'
     extClass = '.FallenSubs'
-    extVersionCode = 13
+    extVersionCode = 14
 }
 
 apply plugin: "kei.plugins.extension.legacy"
