@@ -106,3 +106,31 @@ Dentro de `sortByEpisodeNumberDescending`, un item sin número identificable se 
 
 - **En `EPISODE`**: va al *principio* del bloque (antes que los que sí tienen número). Esto es así para no desplazar el puesto de un episodio real ante trackers como AniList/MAL, que cuentan por posición/número -- es preferible que un caso ambiguo quede visualmente primero a que se intercale entre episodios reales.
 - **En el resto de categorías (OP/ED/Special/etc.)**: va al *final* del bloque, tratándose como el valor más bajo dentro de los que sí tienen número. Por ejemplo, entre `OP2` y `OP` (sin número), el orden correcto es `OP2, OP` -- como si `OP` fuera un "OP1" implícito. Si además existiera un `OP1` explícito en la misma lista, el orden sería `OP2, OP1, OP` (el implícito, al no tener evidencia de si es el mismo que el explícito o no, se coloca al final por seguridad).
+
+## Versiones (`v2`, `v3`) y formatos `SxxEyy`
+
+- **Versión pegada al episodio:** `extractEpisodeNumber` entiende `16v2` y también
+  `S01E07v2`, `E07v2` y `EP07v2` (episodio 7, versión 2). Antes, en estos últimos,
+  el número de la versión se tomaba por el número de episodio.
+- **Especiales abreviados:** `SP01`, `SP1`... se detectan como `SPECIAL`
+  (`Special 1`, `episodeNumber = 0F`) igual que `Special` o `SP` sueltos. Antes
+  `SP01` se tomaba por el episodio 1.
+- **`extractVersionNumber(rawName)`:** devuelve la versión de la publicación
+  (`2`, `3`...) o `null` si el nombre no indica ninguna. Reconoce `01v2`,
+  `S01E07v2`, `[Multi-Subs]v2`, `[v2]` y `(v2)`. No cambia el número de
+  episodio ni el nombre mostrado; sirve para marcar la versión (por ejemplo `v2`
+  junto al episodio corregido) o para comparar publicaciones del mismo episodio.
+
+## Etiquetas técnicas sin corchetes y nombres con puntos
+
+- **Resolución, códec y audio sueltos:** `1080p`, `2160p`, `1920x1080`, `4K`, `H.264`, `x265`,
+  `AV1`, `10bit`, `Hi10`, `AAC2.0`, `EAC3`, `DDP5.1`... ya no se toman por el número de episodio
+  cuando vienen sin corchetes. Antes solo se descartaban entre corchetes o paréntesis; por eso
+  `...WEB-DL.AAC2.0.H.264-GRUPO.mkv` daba el episodio 264.
+- **Nombres estilo scene:** si el nombre no tiene espacios y tiene 2 o más puntos
+  (`Show.Name.S03E01.Titulo.1080p.WEB-DL.mkv`), los puntos se leen como separadores de palabras.
+  El punto decimal con un solo dígito detrás (`05.5`, `12.5`) y la extensión final se respetan; en `Show.100.05` o `Show.2024.05` el punto separa el título o el año del episodio.
+- **Variantes `NCEDv1`, `NCEDv2`, `NCOPv2`:** el sufijo `vN` pegado a OP/ED/NCOP/NCED ya no impide
+  detectarlos como opening/ending (antes solo se detectaba `NCOP`/`NCED` sin sufijo); el número
+  que queda es el de la variante (`ED 1`, `ED 2`).
+  

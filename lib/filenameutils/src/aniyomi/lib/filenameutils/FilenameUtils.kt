@@ -42,17 +42,52 @@ object FilenameUtils {
     // con el cierre mal formado (ej. "(x264 FLAC.mkv", sin ")") y el número
     // quedaría suelto en el título.
     private val NON_EPISODE_TAG_REGEX = Regex(
-        """^[\[({]?(?:(?:nc)?(?:op|ed)\d*|isong\d*|is\d*|v\d+|[xh]26[45]|\d+(?:st|nd|rd|th))$""",
+        """^[\[({]?(?:(?:nc)?(?:op|ed)\d*(?:v\d+)?|isong\d*|is\d*|v\d+|[xh]26[45]|\d+(?:st|nd|rd|th))$""",
         RegexOption.IGNORE_CASE,
     )
 
     // Sufijo de versión pegado sin separador al número real (ej. "16v2" =
-    // episodio 16, versión 2). Sin esto, "2" ganaría por ser el último
-    // dígito de la palabra.
+    // episodio 16, versión 2; "S01E07v2" = temporada 1, episodio 7, versión
+    // 2). Sin esto, "2" ganaría por ser el último dígito de la palabra. El
+    // grupo 1 es la parte anterior a la versión (con su prefijo SxxEyy/Eyy/EPyy
+    // si lo tiene), de la que luego se toma el número.
     private val ATTACHED_VERSION_SUFFIX_REGEX = Regex(
-        """^(\d+)v\d+$""",
+        """^((?:s\d+)?(?:e|ep)?\d+)v\d+$""",
         RegexOption.IGNORE_CASE,
     )
+
+    // Versión de la publicación (v2, v3) en cualquier parte del nombre: pegada a
+    // un número ("01v2", "S01E07v2"), tras una etiqueta ("[Multi-Subs]v2") o
+    // entre signos ("[v2]", "(v2)"). Se busca en el nombre sin limpiar.
+    private val RELEASE_VERSION_REGEX = Regex(
+        """(?:(?<=\d)|(?<=[\[\]()]))v(\d+)\b""",
+        RegexOption.IGNORE_CASE,
+    )
+
+    // Resolución, códec, audio y similares SIN corchetes, típicos de releases que usan puntos como
+    // separador ("Show.S03E01.1080p.WEB-DL.AAC2.0.H.264-GRUPO.mkv"). Llevan dígitos y, si no se
+    // descartan, el último ("H.264" -> 264) se tomaría por el número de episodio. Solo se incluyen
+    // tokens con dígitos (los demás no afectan al número) y siempre como palabra completa.
+    private val TECHNICAL_TOKEN_REGEX = Regex(
+        """(?<![A-Za-z0-9])(?:\d{3,4}[pi]|\d{3,4}x\d{3,4}|4k|[hx]\.?26[45]|av1|10bit|8bit|hi10p?|aac\d*(?:\.\d)?|e?ac-?3|ddp?\d(?:\.\d)?)(?![A-Za-z0-9])""",
+        RegexOption.IGNORE_CASE,
+    )
+
+    // Punto que separa palabras en un nombre estilo scene. Solo se respeta el punto decimal con
+    // un único dígito detrás ("5.5", "12.5"); en "100.05" o "2024.05" el punto separa el título
+    // o el año del número de episodio.
+    private val WORD_DOT_REGEX = Regex("""(?<!\d)\.|\.(?!\d(?!\d))""")
+
+    // Descarta las etiquetas técnicas sin corchetes y, si el nombre usa puntos en lugar de espacios
+    // (sin espacios y con 2 o más puntos), los convierte en espacios para poder separar las palabras.
+    // La extensión final (.mkv, .mp4) se conserva tal cual.
+    private fun stripTechnicalTokens(text: String): String {
+        val base = text.substringBeforeLast('.', text)
+        val extension = text.substring(base.length)
+        val sceneStyle = base.none(Char::isWhitespace) && base.count { it == '.' } >= 2
+        val cleaned = TECHNICAL_TOKEN_REGEX.replace(base, " ")
+        return (if (sceneStyle) WORD_DOT_REGEX.replace(cleaned, " ") else cleaned) + extension
+    }
 
     // Conector "parte/part" (ej. "12 Fin parte 1" = episodio 12, parte 1,
     // no episodio 1): el número que lo sigue se descarta como episodio.
@@ -108,7 +143,7 @@ object FilenameUtils {
      */
     fun extractEpisodeNumber(rawName: String): Float? {
         val normalized = rawName.replace(Regex("""\s+"""), " ").trim()
-        val withoutBrackets = BRACKETED_CONTENT_REGEX.replace(normalized, " ")
+        val withoutBrackets = stripTechnicalTokens(BRACKETED_CONTENT_REGEX.replace(normalized, " "))
 
         EXPLICIT_EPISODE_REGEX.find(withoutBrackets)?.let {
             return it.groupValues[1].toFloatOrNull()
@@ -134,11 +169,24 @@ object FilenameUtils {
             }
 
         ATTACHED_VERSION_SUFFIX_REGEX.find(realEpisodeWord)?.let {
-            return it.groupValues[1].toFloatOrNull()
+            return TRAILING_NUMBER_REGEX.find(it.groupValues[1])?.groupValues?.get(1)?.toFloatOrNull()
         }
 
         return TRAILING_NUMBER_REGEX.find(realEpisodeWord)?.groupValues?.get(1)?.toFloatOrNull()
     }
+
+    /**
+     * Extrae la versión de la publicación ("v2", "v3") de un nombre de archivo.
+     *
+     * Reconoce la versión pegada a un número ("Show - 01v2", "S01E07v2"), tras
+     * una etiqueta ("[Multi-Subs]v2") o entre signos ("[v2]", "(v2)"). No
+     * afecta a [extractEpisodeNumber]: sirve para mostrar o comparar
+     * versiones (por ejemplo, marcar "v2" junto al episodio corregido).
+     *
+     * @return el número de versión (2, 3...), o `null` si el nombre no indica
+     *   ninguna (una publicación sin versión es la versión 1 implícita).
+     */
+    fun extractVersionNumber(rawName: String): Int? = RELEASE_VERSION_REGEX.find(rawName)?.groupValues?.get(1)?.toIntOrNull()
 
     /**
      * Extrae el último número suelto del nombre, sin el filtro de tags
@@ -149,7 +197,7 @@ object FilenameUtils {
      */
     fun extractTrailingNumber(rawName: String): Float? {
         val normalized = rawName.replace(Regex("""\s+"""), " ").trim()
-        val withoutBrackets = BRACKETED_CONTENT_REGEX.replace(normalized, " ")
+        val withoutBrackets = stripTechnicalTokens(BRACKETED_CONTENT_REGEX.replace(normalized, " "))
         val withoutExtension = withoutBrackets.substringBeforeLast('.')
         return TRAILING_NUMBER_REGEX.find(withoutExtension)?.groupValues?.get(1)?.toFloatOrNull()
     }
@@ -189,9 +237,9 @@ object FilenameUtils {
     // "NC" delante).
     private val CATEGORY_PATTERNS: List<Pair<EpisodeCategory, Regex>> = listOf(
         EpisodeCategory.INSERT_SONG to Regex("""\b(?:is\d*|isong\d*|insert\s*song|image\s*song)\b""", RegexOption.IGNORE_CASE),
-        EpisodeCategory.ENDING to Regex("""\b(?:(?:nc)?ed\d*|ending\d*|ncending\d*)\b""", RegexOption.IGNORE_CASE),
-        EpisodeCategory.OPENING to Regex("""\b(?:(?:nc)?op\d*|opening\d*|ncopening\d*)\b""", RegexOption.IGNORE_CASE),
-        EpisodeCategory.SPECIAL to Regex("""\b(?:special|especial|sp)\b""", RegexOption.IGNORE_CASE),
+        EpisodeCategory.ENDING to Regex("""\b(?:(?:nc)?ed\d*(?:v\d+)?|ending\d*|ncending\d*)\b""", RegexOption.IGNORE_CASE),
+        EpisodeCategory.OPENING to Regex("""\b(?:(?:nc)?op\d*(?:v\d+)?|opening\d*|ncopening\d*)\b""", RegexOption.IGNORE_CASE),
+        EpisodeCategory.SPECIAL to Regex("""\b(?:special|especial|sp\d*)\b""", RegexOption.IGNORE_CASE),
         EpisodeCategory.EXTRA to Regex("""\bextra(?:s)?\b""", RegexOption.IGNORE_CASE),
         EpisodeCategory.OVA to Regex("""\b(?:ova|oav)\b""", RegexOption.IGNORE_CASE),
         EpisodeCategory.MOVIE to Regex("""\b(?:movie|film|pel[ií]cula)\b""", RegexOption.IGNORE_CASE),

@@ -103,7 +103,12 @@ internal class MegaProxyServer(
             ?: return newFixedLengthResponse(Status.NOT_FOUND, "text/plain", "Stream no registrado: $streamId")
 
         val rangeHeader = session.headers["range"]
-        val (start, end) = parseRange(rangeHeader, info.totalSize)
+        val (start, end) = parseRange(rangeHeader, info.totalSize) ?: run {
+            Log.w(tag, "Rango inválido pedido para stream $streamId: Range=$rangeHeader (totalSize=${info.totalSize})")
+            val invalidRangeResponse = newFixedLengthResponse(Status.RANGE_NOT_SATISFIABLE, "text/plain", "Rango inválido")
+            invalidRangeResponse.addHeader("Content-Range", "bytes */${info.totalSize}")
+            return invalidRangeResponse
+        }
 
         return try {
             serveRange(info, start, end)
@@ -117,8 +122,17 @@ internal class MegaProxyServer(
      * Calcula el rango real solicitado. Si no hay header Range, se sirve
      * desde 0 hasta el final (comportamiento de descarga completa, pero
      * ExoPlayer casi siempre manda Range).
+     *
+     * @return el par (start, end) normalizado, o `null` si el rango pedido
+     *   es degenerado/inválido (ej. "bytes=175-174", start > end) -- pasarlo
+     *   tal cual a [serveRange] daba requestedLength <= 0 y un header
+     *   Content-Range con start > end, que el cliente HTTP del reproductor
+     *   no podía parsear ("could not parse long range"): el reproductor se
+     *   quedaba sin ese rango y el contenedor MKV terminaba incompleto
+     *   ("Unexpected end of file", "seconds missing from the timeline"),
+     *   aunque el resto del archivo sí hubiera llegado bien.
      */
-    private fun parseRange(rangeHeader: String?, totalSize: Long): Pair<Long, Long> {
+    private fun parseRange(rangeHeader: String?, totalSize: Long): Pair<Long, Long>? {
         if (rangeHeader.isNullOrBlank() || !rangeHeader.startsWith("bytes=")) {
             return 0L to (totalSize - 1)
         }
@@ -126,18 +140,30 @@ internal class MegaProxyServer(
         val parts = spec.split("-")
         val start = parts.getOrNull(0)?.toLongOrNull() ?: 0L
         val end = parts.getOrNull(1)?.takeIf { it.isNotBlank() }?.toLongOrNull() ?: (totalSize - 1)
-        return start to end.coerceAtMost(totalSize - 1)
+        val clampedEnd = end.coerceAtMost(totalSize - 1)
+        if (start < 0 || start > clampedEnd) return null
+        return start to clampedEnd
     }
 
-    // Cliente con timeouts propios para pedir el rango a MEGA: sin esto, si
-    // MEGA acepta la conexión pero no responde nada, la llamada podría
-    // quedarse colgada varios minutos en vez de fallar rápido. callTimeout
-    // solo cubre hasta recibir los headers, no la descarga completa del
-    // cuerpo (esa va aparte, vía streaming, en decryptStreamInto).
+    // Cliente con timeouts propios para pedir el rango a MEGA.
+    //
+    // connectTimeout: falla rápido si ni siquiera se puede conectar.
+    // readTimeout: tiempo máximo SIN recibir ningún byte nuevo -- 30s da
+    // margen para pausas normales de una transferencia larga (más que los
+    // 15s originales, que cortaban conexiones sanas simplemente porque el
+    // ancho de banda de MEGA es variable, sobre todo en cuentas free).
+    // callTimeout: DELIBERADAMENTE SIN LÍMITE. Un callTimeout fijo limita
+    // la duración de la petición COMPLETA sin importar cuánto pese el
+    // rango pedido -- con un límite de 20s, cualquier rango grande que
+    // tarde más en bajar (algo esperable al pedir el buffer inicial de un
+    // video, o con una cuenta con bajo ancho de banda) se cortaba sí o sí,
+    // sin que hubiera nada roto en la conexión. Eso era la causa real de
+    // "reproduce 1 segundo, se corta, reintenta" en links públicos y de
+    // que el contenido propio nunca llegara a arrancar.
     private val rangeClient = client.newBuilder()
         .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(15, TimeUnit.SECONDS)
-        .callTimeout(20, TimeUnit.SECONDS)
+        .readTimeout(30, TimeUnit.SECONDS)
+        .callTimeout(0, TimeUnit.SECONDS)
         .build()
 
     /**
@@ -176,6 +202,21 @@ internal class MegaProxyServer(
             val upstreamCode = upstreamResponse.code
             val upstreamBody = runCatching { upstreamResponse.body.string() }.getOrNull()
             upstreamResponse.close()
+            if (upstreamCode == 509) {
+                Log.e(
+                    tag,
+                    "MEGA cortó la descarga con 509 (cuota de transferencia agotada) a mitad de " +
+                        "bytes=$alignedStart-$end de ${info.downloadUrl.substringBefore('?')}. " +
+                        "Esto deja el archivo incompleto para el reproductor -- si el video se queda " +
+                        "cargando sin avanzar o reporta 'end of file'/'seconds missing from the " +
+                        "timeline', esta es la causa más probable.",
+                )
+                return newFixedLengthResponse(
+                    Status.SERVICE_UNAVAILABLE,
+                    "text/plain",
+                    "Se agotó la cuota de transferencia de MEGA para esta cuenta/IP por hoy.",
+                )
+            }
             Log.e(
                 tag,
                 "MEGA respondió $upstreamCode al pedir bytes=$alignedStart-$end de " +
@@ -258,7 +299,27 @@ internal class MegaProxyServer(
 
         while (emitted < totalPlainBytesToEmit) {
             val read = readFully(cipherStream, buffer)
-            if (read <= 0) break
+            if (read <= 0) {
+                // cipherStream se quedó sin datos ANTES de completar los
+                // totalPlainBytesToEmit prometidos a NanoHTTPD (vía el
+                // Content-Length que ya se armó en serveRange). Antes esto
+                // hacía "break" en silencio: la función terminaba "bien" (sin
+                // excepción), el finally de arriba cerraba pipedOut como si
+                // nada, y NanoHTTPD -- que sigue esperando leer los bytes
+                // faltantes del Content-Length que ya prometimos -- se
+                // encontraba el pipe cerrado y tiraba un IOException "Pipe
+                // closed" sin ningún contexto de qué pasó realmente (visto
+                // en anikku_crash_logs.txt). El corte real más probable es
+                // que MEGA cerró la conexión a mitad de camino (cuota de
+                // transferencia agotada u otro corte de red); lanzar acá
+                // hace que ese catch de más arriba SÍ lo registre como
+                // error real en vez de perderse en silencio.
+                throw java.io.IOException(
+                    "MEGA cortó el stream a mitad de la transferencia: se llevaban " +
+                        "$emitted de $totalPlainBytesToEmit bytes en claro esperados. " +
+                        "Causa más probable: cuota de transferencia agotada o corte de red.",
+                )
+            }
 
             // Los datos cifrados deben venir en múltiplos de 16 salvo el
             // último bloque del archivo, que MEGA no rellena: si el tramo

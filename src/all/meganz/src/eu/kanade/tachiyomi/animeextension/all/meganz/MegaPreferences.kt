@@ -68,4 +68,14 @@ object MegaPreferences {
     private const val PREF_SHOW_FILENAME_DEFAULT = false
 
     fun showFilename(prefs: SharedPreferences): Boolean = prefs.getBoolean(PREF_SHOW_FILENAME, PREF_SHOW_FILENAME_DEFAULT)
+
+    // ── Preferencia: email de MEGA recordado ──────────────────────────────────
+    //
+    // Solo el email (para no tener que retipearlo cada vez); la contraseña
+    // JAMÁS se guarda acá ni en ningún otro lado -- se usa una sola vez, en
+    // memoria, para derivar la sesión (ver MegaSessionStore en la librería).
+
+    const val PREF_MEGA_EMAIL = "meganz_account_email"
+
+    fun getSavedEmail(prefs: SharedPreferences): String = prefs.getString(PREF_MEGA_EMAIL, "") ?: ""
 }

@@ -1,6 +1,7 @@
 package aniyomi.lib.megaextractor
 
 import kotlinx.serialization.Serializable
+import java.math.BigInteger
 
 // ── Respuestas crudas de la API (a=f, listar árbol) ────────────────────────
 
@@ -33,6 +34,23 @@ internal data class MegaDownloadResponse(
     val e: Int? = null, // código de error si algo falló
 )
 
+// ── Login de cuenta (a=us0 / a=us) ─────────────────────────────────────────
+
+@Serializable
+internal data class MegaPreloginResponse(
+    val v: Int? = null, // versión de la cuenta: 1 (legacy, sin salt) o 2 (PBKDF2 con salt)
+    val s: String? = null, // salt en base64, solo presente si v=2
+)
+
+@Serializable
+internal data class MegaLoginResponse(
+    val k: String? = null, // master key cifrada (AES-ECB con la login key), base64
+    val u: String? = null, // handle del usuario, base64
+    val privk: String? = null, // clave privada RSA cifrada con la master key, base64
+    val csid: String? = null, // session id cifrado con la clave pública RSA, base64
+    val tsid: String? = null, // alternativa a csid para cuentas sin par RSA (no soportado acá)
+)
+
 // ── Modelo ya descifrado, usado por el resto de la extensión ──────────────
 
 /**
@@ -57,4 +75,35 @@ data class MegaNode(
     val fileKey: MegaFileKeyMaterial?,
     // Master key de la propia carpeta, solo si isFolder, para descifrar hijos
     val folderKey: ByteArray?,
+)
+
+// Todo lo de acá para abajo es material de login/sesión: se queda interno a
+// propósito (nunca cruza la API pública de MegaExtractor, que solo expone
+// login()/logout()/isLoggedIn()/loggedInEmail()) para no filtrar sid/master
+// key crudos -- material sensible -- a quien consuma la librería.
+
+/** Key de login v2 derivada de la contraseña vía PBKDF2 (ver [MegaCrypto.deriveV2LoginKey]). */
+internal data class MegaV2LoginKey(
+    val key: ByteArray, // descifra "k" (master key) de la respuesta de login
+    val authKey: ByteArray, // se manda como "uh" en vez de la contraseña
+)
+
+/** Componentes de la clave privada RSA de la cuenta, ya descifrados (ver [MegaCrypto.parseMegaRsaPrivateKey]). */
+internal data class MegaRsaPrivateKey(
+    val p: BigInteger,
+    val q: BigInteger,
+    val d: BigInteger,
+    val u: BigInteger, // p⁻¹ mod q
+)
+
+/**
+ * Sesión de cuenta ya autenticada: lo mínimo necesario para adjuntar "sid" a
+ * las llamadas y para descifrar los nodos del propio Cloud Drive. Es lo que
+ * persiste [MegaSessionStore] entre extensiones y reinicios de la app.
+ */
+internal data class MegaAccountSession(
+    val email: String,
+    val sid: ByteArray, // 43 bytes (SIDLEN); se adjunta en cada request como &sid=
+    val masterKey: ByteArray, // 16 bytes; descifra las node keys del propio Cloud Drive
+    val ownHandle: ByteArray, // 8 bytes (handle de usuario); hace falta para elegir el par correcto en un compound key
 )

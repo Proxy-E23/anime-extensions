@@ -45,7 +45,7 @@ class MegaExtractor(private val client: OkHttpClient) {
 
     /**
      * Lista el contenido de una carpeta pública ya descifrado. Lanza
-     * [MegaApi.MegaApiException] si el link es inválido o fue eliminado.
+     * [MegaApiException] si el link es inválido o fue eliminado.
      *
      * Filtra archivos que no sean de video (p.ej. .rar, .zip, .txt); las
      * carpetas siempre se conservan para no perder acceso a sus hijos.
@@ -55,6 +55,47 @@ class MegaExtractor(private val client: OkHttpClient) {
         return api.listFolder(folderLink.handle, folderKeyRaw)
             .filter { it.isFolder || it.isVideo() }
     }
+
+    // ── Cuenta / login ──────────────────────────────────────────────────────
+    //
+    // La sesión vive en MegaApi (auto-cargada de MegaSessionStore al crear
+    // esta instancia) y se adjunta sola a TODAS las llamadas de MegaApi.call,
+    // incluidas las de listFolder/videoFromNode de más arriba -- por eso
+    // cualquier extensión que use esta librería aprovecha el ancho de banda
+    // de la cuenta apenas exista una sesión guardada, sin tener que cambiar
+    // nada en su propio código ni loguearse aparte. Pensado para que solo la
+    // extensión "MEGA" tenga UI de login.
+
+    /** true si hay una sesión de MEGA activa (de esta extensión o de cualquier otra que use la librería). */
+    fun isLoggedIn(): Boolean = api.currentSession != null
+
+    /** Email de la cuenta logueada, o null si no hay sesión activa. */
+    fun loggedInEmail(): String? = api.currentSession?.email
+
+    /**
+     * Inicia sesión con la cuenta de MEGA. Solo cuentas v2 (modernas, con
+     * salt) por ahora. No devuelve nada: si no tira excepción, anduvo --
+     * confirmar con [isLoggedIn]/[loggedInEmail].
+     *
+     * @param pin código de verificación en dos pasos, si la cuenta lo tiene
+     * activo.
+     * @throws MegaApiException code=-9 con email/contraseña
+     * incorrectos, code=-26 si falta el código de 2FA.
+     * @throws UnsupportedOperationException si la cuenta es v1 (legacy).
+     */
+    fun login(email: String, password: String, pin: String? = null) {
+        api.login(email, password, pin)
+    }
+
+    /** Cierra la sesión para TODAS las extensiones que usan esta librería. */
+    fun logout() = api.logout()
+
+    /**
+     * Lista el Cloud Drive (raíz) de la cuenta logueada. Requiere sesión
+     * activa (ver [isLoggedIn]). Igual que [listFolder], filtra a carpetas +
+     * archivos de video reconocidos.
+     */
+    fun listCloudDrive(): List<MegaNode> = api.listCloudDrive().filter { it.isFolder || it.isVideo() }
 
     companion object {
         private val VIDEO_EXTENSIONS = setOf(
@@ -110,6 +151,27 @@ class MegaExtractor(private val client: OkHttpClient) {
             ?: return emptyList()
 
         val download = api.getDownloadUrl(node.handle, folderHandle)
+        val downloadUrl = download.g ?: return emptyList()
+        val totalSize = download.s ?: node.size
+
+        return buildVideoFromDownload(
+            streamId = node.handle,
+            downloadUrl = downloadUrl,
+            keyMaterial = keyMaterial,
+            totalSize = totalSize,
+            displayName = node.name,
+        )
+    }
+
+    /**
+     * Resuelve un [Video] de un archivo del propio Cloud Drive (requiere
+     * sesión activa). Análogo a [videoFromNode], pero para nodos que salen
+     * de [listCloudDrive] en vez de un link de carpeta público.
+     */
+    fun videoFromOwnFile(node: MegaNode): List<Video> {
+        val keyMaterial = node.fileKey ?: return emptyList()
+
+        val download = api.getOwnFileDownloadUrl(node.handle)
         val downloadUrl = download.g ?: return emptyList()
         val totalSize = download.s ?: node.size
 
