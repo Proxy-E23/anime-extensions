@@ -110,8 +110,8 @@ class WingZeroPlus :
     // Reintenta ante fallos de conexión transitorios (p. ej. errores de HTTP/2)
     // antes de rendirse.
     private suspend fun getDocumentWithRetry(url: String, maxAttempts: Int = 3): Document {
-        var lastError: Exception? = null
-        repeat(maxAttempts) { attempt ->
+        var lastError: IOException? = null
+        for (attempt in 0 until maxAttempts) {
             try {
                 return client.newCall(GET(url, headers)).execute().asJsoup()
             } catch (e: IOException) {
@@ -119,7 +119,7 @@ class WingZeroPlus :
                 if (attempt < maxAttempts - 1) delay(500L * (attempt + 1))
             }
         }
-        throw lastError ?: IOException("No se pudo completar la petición a $url")
+        throw IOException("No se pudo completar la petición a $url", lastError)
     }
 
     override fun popularAnimeSelector(): String = "div#tm-right-section div.uk-grid div.uk-margin-bottom"
