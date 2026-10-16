@@ -5,16 +5,16 @@ import eu.kanade.tachiyomi.animesource.model.AnimesPage
 import eu.kanade.tachiyomi.animesource.model.SAnime
 import eu.kanade.tachiyomi.animesource.model.SEpisode
 import eu.kanade.tachiyomi.animesource.model.Video
-import eu.kanade.tachiyomi.animesource.online.ParsedAnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.util.asJsoup
+import keiyoushi.utils.ParsedAnimeHttpLegacySource
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 
-class VampirNoFansub : ParsedAnimeHttpSource() {
+class VampirNoFansub : ParsedAnimeHttpLegacySource() {
 
     override val name = "Vampir no Fansub"
     override val baseUrl = "https://vampirnofansubs2.wordpress.com"
@@ -246,7 +246,7 @@ class VampirNoFansub : ParsedAnimeHttpSource() {
     override fun videoListParse(response: Response): List<Video> = throw UnsupportedOperationException()
     override fun videoListSelector(): String = throw UnsupportedOperationException()
     override fun videoFromElement(element: Element): Video = throw UnsupportedOperationException()
-    override fun videoUrlParse(document: Document): String = throw UnsupportedOperationException()
+    override fun videoUrlParse(response: okhttp3.Response): String = throw UnsupportedOperationException()
 
     override suspend fun getVideoList(episode: SEpisode): List<Video> = throw Exception(
         "Esta extensión no descarga videos automáticamente. " +

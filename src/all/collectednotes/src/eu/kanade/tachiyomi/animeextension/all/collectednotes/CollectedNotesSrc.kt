@@ -12,8 +12,8 @@ import eu.kanade.tachiyomi.animesource.model.AnimesPage
 import eu.kanade.tachiyomi.animesource.model.SAnime
 import eu.kanade.tachiyomi.animesource.model.SEpisode
 import eu.kanade.tachiyomi.animesource.model.Video
-import eu.kanade.tachiyomi.animesource.online.AnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
+import keiyoushi.utils.AnimeHttpLegacySource
 import keiyoushi.utils.getPreferencesLazy
 import kotlinx.serialization.json.Json
 import okhttp3.Request
@@ -22,7 +22,7 @@ import java.text.SimpleDateFormat
 import java.util.Locale
 
 class CollectedNotesSrc :
-    AnimeHttpSource(),
+    AnimeHttpLegacySource(),
     ConfigurableAnimeSource {
 
     override val name = "Collected Notes"

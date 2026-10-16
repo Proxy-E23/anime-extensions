@@ -10,9 +10,9 @@ import eu.kanade.tachiyomi.animesource.model.AnimesPage
 import eu.kanade.tachiyomi.animesource.model.SAnime
 import eu.kanade.tachiyomi.animesource.model.SEpisode
 import eu.kanade.tachiyomi.animesource.model.Video
-import eu.kanade.tachiyomi.animesource.online.ParsedAnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.util.asJsoup
+import keiyoushi.utils.ParsedAnimeHttpLegacySource
 import keiyoushi.utils.addSwitchPreference
 import keiyoushi.utils.getPreferencesLazy
 import kotlinx.coroutines.CoroutineScope
@@ -28,7 +28,7 @@ import org.jsoup.nodes.Element
 import java.io.IOException
 
 class WingZeroPlus :
-    ParsedAnimeHttpSource(),
+    ParsedAnimeHttpLegacySource(),
     ConfigurableAnimeSource {
 
     override val name = "Wing Zero Plus"
@@ -467,7 +467,7 @@ class WingZeroPlus :
     // Los tres métodos abstractos no se usan porque sobreescribimos getVideoList
     override fun videoListSelector(): String = throw UnsupportedOperationException()
     override fun videoFromElement(element: Element): Video = throw UnsupportedOperationException()
-    override fun videoUrlParse(document: Document): String = throw UnsupportedOperationException()
+    override fun videoUrlParse(response: okhttp3.Response): String = throw UnsupportedOperationException()
 
     override suspend fun getVideoList(episode: SEpisode): List<Video> {
         val epUrl = episode.url.ifBlank {

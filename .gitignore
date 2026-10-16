@@ -16,3 +16,4 @@ signingkey.jks
 nul
 cmdtools.zip
 *.class
+*.jks

@@ -13,9 +13,9 @@ import eu.kanade.tachiyomi.animesource.model.AnimesPage
 import eu.kanade.tachiyomi.animesource.model.SAnime
 import eu.kanade.tachiyomi.animesource.model.SEpisode
 import eu.kanade.tachiyomi.animesource.model.Video
-import eu.kanade.tachiyomi.animesource.online.ParsedAnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.util.asJsoup
+import keiyoushi.utils.ParsedAnimeHttpLegacySource
 import keiyoushi.utils.addListPreference
 import keiyoushi.utils.addSwitchPreference
 import keiyoushi.utils.getPreferencesLazy
@@ -33,7 +33,7 @@ import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
 
 class GakuensaiFansub :
-    ParsedAnimeHttpSource(),
+    ParsedAnimeHttpLegacySource(),
     ConfigurableAnimeSource {
 
     override val name = "Gakuensai Fansub"
@@ -594,7 +594,7 @@ class GakuensaiFansub :
     // ============================== Video list ==============================
     override fun videoListSelector(): String = throw UnsupportedOperationException()
     override fun videoFromElement(element: Element): Video = throw UnsupportedOperationException()
-    override fun videoUrlParse(document: Document): String = throw UnsupportedOperationException()
+    override fun videoUrlParse(response: okhttp3.Response): String = throw UnsupportedOperationException()
 
     override suspend fun getVideoList(episode: SEpisode): List<Video> {
         val parts = episode.url.split("::")

@@ -1,6 +1,7 @@
 package aniyomi.lib.m3u8server
 
 import android.util.Log
+import keiyoushi.utils.decodeHex
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
@@ -11,7 +12,6 @@ import okhttp3.Request
 import org.nanohttpd.protocols.http.IHTTPSession
 import org.nanohttpd.protocols.http.NanoHTTPD
 import org.nanohttpd.protocols.http.response.Response
-import org.nanohttpd.protocols.http.response.Response.newChunkedResponse
 import org.nanohttpd.protocols.http.response.Response.newFixedLengthResponse
 import org.nanohttpd.protocols.http.response.Status
 import java.io.ByteArrayInputStream
@@ -144,7 +144,12 @@ class M3u8HttpServer(
             }
             Log.d(tag, "Segment processing completed successfully, data size: ${segmentData.size} bytes")
             val inputStream = ByteArrayInputStream(segmentData)
-            newChunkedResponse(Status.OK, "video/mp2t", inputStream)
+            newFixedLengthResponse(
+                Status.OK,
+                "video/mp2t",
+                inputStream,
+                segmentData.size.toLong(),
+            )
         } catch (e: UpstreamStatusException) {
             Log.w(tag, "Upstream segment HTTP ${e.code} for $url: ${e.message}")
             passThroughStatus(e)
@@ -207,10 +212,11 @@ class M3u8HttpServer(
     ): Map<String, String> {
         val headers = mutableMapOf<String, String>()
 
+        // Let OkHttp negotiate compression and decode upstream playlists and segments.
         session.headers.forEach { (key, value) ->
             when (key.lowercase()) {
                 "user-agent", "referer", "origin", "accept", "accept-language",
-                "accept-encoding", "connection", "cache-control", "pragma",
+                "connection", "cache-control", "pragma",
                 -> {
                     headers[key.lowercase()] = value
                 }
@@ -357,28 +363,27 @@ class M3u8HttpServer(
         if (normalizedIv.length != 32) {
             throw IOException("Invalid AES-128 IV length: ${normalizedIv.length}")
         }
+        val ivBytes = try {
+            normalizedIv.decodeHex()
+        } catch (e: IllegalArgumentException) {
+            throw IOException("Invalid AES-128 IV", e)
+        }
         return try {
             val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
             cipher.init(
                 Cipher.DECRYPT_MODE,
                 SecretKeySpec(key, "AES"),
-                IvParameterSpec(normalizedIv.hexToByteArray()),
+                IvParameterSpec(ivBytes),
             )
             cipher.doFinal(data)
         } catch (e: GeneralSecurityException) {
             throw IOException("Failed to decrypt AES-128 segment", e)
-        } catch (e: NumberFormatException) {
-            throw IOException("Invalid AES-128 IV", e)
         }
     }
 
     private fun Long.toHlsIv(): String = toString(16).padStart(32, '0')
 
     private fun String.normalizeHlsIv(): String = removePrefix("0x").removePrefix("0X").padStart(32, '0')
-
-    private fun String.hexToByteArray(): ByteArray = ByteArray(length / 2) { index ->
-        substring(index * 2, index * 2 + 2).toInt(16).toByte()
-    }
 
     /**
      * Health check
@@ -586,7 +591,7 @@ class M3u8HttpServer(
         it.groupValues[1] to it.groupValues[2].trim('"')
     }
 
-    private fun resolveHlsUrl(baseHttpUrl: okhttp3.HttpUrl?, uri: String): String = baseHttpUrl?.resolve(uri)?.toString() ?: uri
+    private fun resolveHlsUrl(baseHttpUrl: HttpUrl?, uri: String): String = baseHttpUrl?.resolve(uri)?.toString() ?: uri
 
     private fun createLocalSegmentUrl(
         serverPort: Int,

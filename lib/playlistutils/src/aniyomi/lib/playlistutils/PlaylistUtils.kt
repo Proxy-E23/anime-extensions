@@ -1,11 +1,11 @@
 package aniyomi.lib.playlistutils
 
 import android.net.Uri
+import android.util.Log
 import eu.kanade.tachiyomi.animesource.model.Track
 import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.awaitSuccess
-import keiyoushi.utils.UrlUtils
 import keiyoushi.utils.bodyString
 import keiyoushi.utils.commonEmptyHeaders
 import keiyoushi.utils.parallelMapNotNullBlocking
@@ -16,7 +16,12 @@ import okhttp3.OkHttpClient
 import java.io.File
 import kotlin.math.abs
 
-class PlaylistUtils(private val client: OkHttpClient, private val headers: Headers = commonEmptyHeaders) {
+class PlaylistUtils(
+    private val client: OkHttpClient,
+    // Keep the compatibility helper for apps using older OkHttp versions.
+    @Suppress("DEPRECATION")
+    private val headers: Headers = commonEmptyHeaders,
+) {
 
     // ================================ M3U8 ================================
 
@@ -43,7 +48,7 @@ class PlaylistUtils(private val client: OkHttpClient, private val headers: Heade
         subtitleList: List<Track> = emptyList(),
         audioList: List<Track> = emptyList(),
         toStandardQuality: (String) -> String = { quality ->
-            stnQuality(quality)
+            standardQuality(quality)
         },
     ): List<Video> = extractFromHls(
         playlistUrl,
@@ -77,6 +82,7 @@ class PlaylistUtils(private val client: OkHttpClient, private val headers: Heade
      * @param audioList a list of audio tracks associated with the HLS playlist, will append to audio tracks present in the m3u8 playlist (default: empty list)
      * @return a list of Video objects
      */
+    @Suppress("DEPRECATION") // Retain the legacy Video ABI for extensions targeting lib 14.
     fun extractFromHls(
         playlistUrl: String,
         referer: String = playlistUrl.toDefaultReferer(),
@@ -88,7 +94,7 @@ class PlaylistUtils(private val client: OkHttpClient, private val headers: Heade
         subtitleList: List<Track> = emptyList(),
         audioList: List<Track> = emptyList(),
         toStandardQuality: (String) -> String = { quality ->
-            stnQuality(quality)
+            standardQuality(quality)
         },
     ): List<Video> {
         val masterHeaders = masterHeadersGen(headers, referer)
@@ -96,9 +102,8 @@ class PlaylistUtils(private val client: OkHttpClient, private val headers: Heade
         val masterPlaylist = client.newCall(GET(playlistUrl, masterHeaders))
             .execute().bodyString()
 
-        // Check if there isn't multiple streams available
-        if (PLAYLIST_SEPARATOR !in masterPlaylist) {
-            return listOf(
+        val variants = parseHlsMasterPlaylist(playlistUrl, masterPlaylist)
+            ?: return listOf(
                 Video(
                     playlistUrl,
                     videoNameGen("Video"),
@@ -108,26 +113,9 @@ class PlaylistUtils(private val client: OkHttpClient, private val headers: Heade
                     audioTracks = audioList,
                 ),
             )
-        }
-
-        // Get subtitles
-        val subtitleTracks = subtitleList + SUBTITLE_REGEX.findAll(masterPlaylist).mapNotNull {
-            Track(
-                UrlUtils.fixUrl(it.groupValues[2], playlistUrl) ?: return@mapNotNull null,
-                it.groupValues[1],
-            )
-        }.toList()
-
-        // Get audio tracks
-        val audioTracks = audioList + AUDIO_REGEX.findAll(masterPlaylist).mapNotNull {
-            Track(
-                UrlUtils.fixUrl(it.groupValues[2], playlistUrl) ?: return@mapNotNull null,
-                it.groupValues[1],
-            )
-        }.toList()
 
         /*
-         * Stream might have multiple sub-streams separated by [PLAYLIST_SEPARATOR]. Template:
+         * A master playlist lists its variants after `#EXT-X-STREAM-INF` tags. Template:
          *
          * #EXTM3U
          * #EXT-X-STREAM-INF:BANDWIDTH=150000,RESOLUTION=416x234,CODECS="avc1.42e00a,mp4a.40.2"
@@ -155,16 +143,9 @@ class PlaylistUtils(private val client: OkHttpClient, private val headers: Heade
          * https://vixcloud.co/playlist/274438?type=video&rendition=1080p&token=xEfP4QUI9tG-E6whlvwsig&expires=1752746791&edge=sc-u13-01
          *
          */
-        return masterPlaylist.substringAfter(PLAYLIST_SEPARATOR).split(PLAYLIST_SEPARATOR).mapNotNull { stream ->
-            val codec = CODECS_REGEX.find(stream)?.groupValues?.get(1)
-            if (!codec.isNullOrBlank()) {
-                // Skip audio only streams. Can check if `codecs` starts with any of avc/hev1/hvc1/vp9/av01.
-                val codecs = codec.split(',')
-                if (codecs.all { it.startsWith("mp4a") }) return@mapNotNull null
-            }
-
-            val resolution = RESOLUTION_REGEX.find(stream)
-                ?.groupValues?.get(1)
+        return variants.map { variant ->
+            val attributes = variant.attributes
+            val resolution = attributes["RESOLUTION"]
                 ?.let { resolution ->
                     val standardQuality = QUALITY_REGEX.find(resolution)
                         ?.groupValues?.get(1)
@@ -176,26 +157,25 @@ class PlaylistUtils(private val client: OkHttpClient, private val headers: Heade
                         resolution
                     }
                 }
-            val bandwidth = BANDWIDTH_REGEX.find(stream)
-                ?.groupValues?.get(1)
-                ?.toLongOrNull()
+            // BANDWIDTH is the peak rate; AVERAGE-BANDWIDTH is closer to actual data usage.
+            val bandwidth = attributes["AVERAGE-BANDWIDTH"]?.toLongOrNull()?.takeIf { it > 0 }
+                ?: attributes["BANDWIDTH"]?.toLongOrNull()
             val bandwidthFormatted = bandwidth
-                ?.let(::formatBytes)
+                ?.formatBitrate()
+                ?.takeIf(String::isNotEmpty)
             val streamName = listOfNotNull(resolution, bandwidthFormatted).joinToString(" - ")
                 .takeIf { it.isNotBlank() }
                 ?: "Video"
 
-            val videoUrl = stream.substringAfter("\n").substringBefore("\n").let { url ->
-                UrlUtils.fixUrl(url, playlistUrl)?.trimEnd()
-            } ?: return@mapNotNull null
+            val videoUrl = variant.url
 
             bandwidth to Video(
                 url = videoUrl,
                 quality = videoNameGen(streamName),
                 videoUrl = videoUrl,
                 headers = videoHeadersGen(headers, referer, videoUrl),
-                subtitleTracks = subtitleTracks,
-                audioTracks = audioTracks,
+                subtitleTracks = subtitleList + variant.subtitleTracks,
+                audioTracks = audioList + variant.audioTracks,
             )
         }
             .sortedByDescending { (bandwidth, _) ->
@@ -238,12 +218,12 @@ class PlaylistUtils(private val client: OkHttpClient, private val headers: Heade
         subtitleList: List<Track> = emptyList(),
         audioList: List<Track> = emptyList(),
         toStandardQuality: (String) -> String = { quality ->
-            stnQuality(quality)
+            standardQuality(quality)
         },
     ): List<Video> = extractFromDash(
         mpdUrl,
         { videoRes, bandwidth ->
-            videoNameGen(videoRes) + " - ${formatBytes(bandwidth.toLongOrNull())}"
+            listOfNotNull(videoNameGen(videoRes), bandwidth.toLongOrNull()?.formatBitrate()?.takeIf(String::isNotEmpty)).joinToString(" - ")
         },
         referer,
         { _, _ -> mpdHeaders },
@@ -285,12 +265,12 @@ class PlaylistUtils(private val client: OkHttpClient, private val headers: Heade
         subtitleList: List<Track> = emptyList(),
         audioList: List<Track> = emptyList(),
         toStandardQuality: (String) -> String = { quality ->
-            stnQuality(quality)
+            standardQuality(quality)
         },
     ): List<Video> = extractFromDash(
         mpdUrl,
         { videoRes, bandwidth ->
-            videoNameGen(videoRes) + " - ${formatBytes(bandwidth.toLongOrNull())}"
+            listOfNotNull(videoNameGen(videoRes), bandwidth.toLongOrNull()?.formatBitrate()?.takeIf(String::isNotEmpty)).joinToString(" - ")
         },
         referer,
         mpdHeadersGen,
@@ -306,7 +286,7 @@ class PlaylistUtils(private val client: OkHttpClient, private val headers: Heade
      * @param mpdUrl the URL of the .mpd file
      * @param videoNameGen a function that generates a custom name for each video based on its quality and bandwidth
      *     - The parameter `quality` represents the quality of the video segment
-     *     - The parameter `bandwidth` represents the bandwidth of the video segment, in bytes
+     *     - The parameter `bandwidth` represents the bandwidth of the video segment, in bits per second
      *     - Returns the custom name for the video
      * @param referer the referer header value to be sent in the HTTP requests (default: "")
      * @param mpdHeadersGen a function that generates headers for the .mpd request
@@ -322,7 +302,7 @@ class PlaylistUtils(private val client: OkHttpClient, private val headers: Heade
      * @param audioList a list of audio tracks associated with the DASH file, will append to audio tracks present in the dash file (default: empty list)
      * @return a list of Video objects
      */
-    @Suppress("MemberVisibilityCanBePrivate")
+    @Suppress("MemberVisibilityCanBePrivate", "DEPRECATION") // Retain the legacy Video ABI for extensions targeting lib 14.
     fun extractFromDash(
         mpdUrl: String,
         videoNameGen: (String, String) -> String,
@@ -334,7 +314,7 @@ class PlaylistUtils(private val client: OkHttpClient, private val headers: Heade
         subtitleList: List<Track> = emptyList(),
         audioList: List<Track> = emptyList(),
         toStandardQuality: (String) -> String = { quality ->
-            stnQuality(quality)
+            standardQuality(quality)
         },
     ): List<Video> {
         val mpdHeaders = mpdHeadersGen(headers, referer)
@@ -344,8 +324,8 @@ class PlaylistUtils(private val client: OkHttpClient, private val headers: Heade
 
         // Get audio tracks
         val audioTracks = audioList + doc.select("Representation[mimetype~=audio]").map { audioSrc ->
-            val bandwidth = audioSrc.attr("bandwidth").toLongOrNull()
-            Track(audioSrc.text(), formatBytes(bandwidth))
+            val bandwidth = audioSrc.attr("bandwidth").toLongOrNull()?.formatBitrate() ?: ""
+            Track(audioSrc.text(), bandwidth)
         }
 
         return doc.select("Representation[mimetype~=video]").map { videoSrc ->
@@ -366,16 +346,6 @@ class PlaylistUtils(private val client: OkHttpClient, private val headers: Heade
         }
     }
 
-    private fun formatBytes(bytes: Long?): String = when {
-        bytes == null -> ""
-        bytes >= 1_000_000_000 -> "%.2f GB/s".format(bytes / 1_000_000_000.0)
-        bytes >= 1_000_000 -> "%.2f MB/s".format(bytes / 1_000_000.0)
-        bytes >= 1_000 -> "%.2f KB/s".format(bytes / 1_000.0)
-        bytes > 1 -> "$bytes bytes/s"
-        bytes == 1L -> "$bytes byte/s"
-        else -> ""
-    }
-
     // ============================= Utilities ==============================
 
     private fun String.toDefaultReferer(): String = try {
@@ -384,7 +354,16 @@ class PlaylistUtils(private val client: OkHttpClient, private val headers: Heade
         ""
     }
 
-    private fun stnQuality(quality: String): String {
+    /** Formats an HLS/DASH bandwidth, which is given in bits per second. */
+    private fun Long.formatBitrate(): String = when {
+        this >= 1_000_000L -> "%.2f Mbps".format(this / 1_000_000.0)
+        this >= 1_000L -> "${this / 1_000} kbps"
+        this > 0L -> "$this bps"
+        else -> ""
+    }
+
+    /** Returns the closest standard resolution label, such as `720p`, for a pixel height. */
+    fun standardQuality(quality: String): String {
         val intQuality = quality.trim().toIntOrNull() ?: return quality
         val result = STANDARD_QUALITIES.minByOrNull { abs(it - intQuality) } ?: intQuality
         return "${result}p"
@@ -405,19 +384,55 @@ class PlaylistUtils(private val client: OkHttpClient, private val headers: Heade
      * Fix a common issue in VTT (WebVTT) subtitle files where extra or unexpected newline characters break the subtitle format,
      * potentially causing players to fail to render them correctly.
      */
-    fun fixSubtitles(subtitleList: List<Track>): List<Track> = subtitleList.parallelMapNotNullBlocking {
+    fun fixSubtitles(subtitleList: List<Track>): List<Track> = subtitleList.parallelMapNotNullBlocking { track ->
         runCatching {
-            val subData = client.newCall(GET(it.url))
+            val subData = client.newCall(GET(track.url))
                 .awaitSuccess().bodyString()
 
-            val file = File.createTempFile("subs", "vtt")
+            val file = File.createTempFile("subs", ".vtt")
                 .also(File::deleteOnExit)
 
-            file.writeText(FIX_SUBTITLE_REGEX.replace(subData, ::cleanSubtitleData))
+            val vttData = toWebVtt(subData)
+            // Only WebVTT (or data converted to it) gets the gap cleanup; formats like ASS/SSA
+            // legitimately use blank lines between sections and must not be touched by it.
+            val cleanedData = if (vttData.startsWith("WEBVTT")) {
+                FIX_SUBTITLE_REGEX.replace(vttData, ::cleanSubtitleData)
+            } else {
+                vttData
+            }
+            file.writeText(cleanedData)
             val uri = Uri.fromFile(file)
 
-            Track(uri.toString(), it.lang)
+            Track(uri.toString(), track.lang)
+        }.onFailure { e ->
+            Log.w("PlaylistUtils", "Failed to process subtitle track (${track.lang}): ${e.javaClass.simpleName}: ${e.message}")
         }.getOrNull()
+    }
+
+    /**
+     * Converts SubRip subtitle data to WebVTT, leaving anything else unchanged.
+     *
+     * Some hosters serve SubRip content from a `.vtt` URL or behind a `text/vtt` content type.
+     * Players that sniff the format from the content cope with that, but ones that trust the
+     * declared type do not, so the data is normalized to match what it claims to be: WebVTT
+     * requires the `WEBVTT` header, and its cue timings use a dot as the decimal separator
+     * instead of SubRip's comma.
+     *
+     * SubRip's numeric cue indexes are dropped, because a WebVTT cue identifier is optional and
+     * keeping them breaks [FIX_SUBTITLE_REGEX], which runs next: its lookahead only accepts a cue
+     * timing directly after a blank line, so an index line in between makes it treat every single
+     * cue boundary as an illegal gap and replace it with a `&nbsp;` line. That collapses the blank
+     * lines WebVTT needs to separate cues and leaves a file a player loads but cannot render.
+     *
+     * Data that already is WebVTT, and data in a format that carries no SubRip cue timing at all
+     * (SubStation Alpha, for instance), is returned as-is rather than being given a header it
+     * cannot back up.
+     */
+    private fun toWebVtt(subData: String): String {
+        val data = subData.removePrefix("\uFEFF").replace("\r\n", "\n").replace('\r', '\n').trimStart()
+        if (data.startsWith("WEBVTT") || !SRT_TIMECODE_REGEX.containsMatchIn(data)) return data
+        val cues = SRT_TIMECODE_REGEX.replace(data, "$1.$2 --> $3.$4")
+        return "WEBVTT\n\n" + SRT_CUE_INDEX_REGEX.replace(cues, "")
     }
 
     companion object {
@@ -426,21 +441,38 @@ class PlaylistUtils(private val client: OkHttpClient, private val headers: Heade
          *
          * * `$`: Matches the end of a line.
          * * `(\n{2,})`: Captures a group of two or more consecutive newline characters. In VTT files, a double newline usually indicates the end of one "cue" (subtitle block) and the start of another.
-         * * `(?!(?:\d+:)*\d+(?:\.\d+)?\s-+>\s(?:\d+:)*\d+(?:\.\d+)?)`: This is a negative lookahead. It checks that what follows the newlines is NOT a VTT timestamp (e.g., `00:00:10.000 --> 00:00:12.000)`.
+         * * The negative lookahead checks that what follows the newlines is NOT the start of legitimate WebVTT content. It accepts:
+         *     - A VTT timestamp (e.g., `00:00:10.000 --> 00:00:12.000`).
+         *     - A `NOTE` block start (`NOTE` followed by whitespace, newline, or end of line).
+         *     - A `STYLE` or `REGION` block start (followed by whitespace, newline, or end of line).
+         *     - Any single non-blank cue identifier line immediately followed by a cue timing line on the next line (a valid WebVTT cue with an identifier).
          *
-         * **Logic**: If the code finds multiple empty lines, but the next thing it sees isn't a new timestamp, it assumes those empty lines are garbage or mid-text breaks that will break the parser.
+         * **Logic**: If the code finds multiple empty lines, but the next thing it sees isn't a new timestamp, `NOTE`/`STYLE`/`REGION` block, or an identifier line leading into a timing line, it assumes those empty lines are garbage or mid-text breaks that will break the parser.
          */
-        private val FIX_SUBTITLE_REGEX = Regex("""$(\n{2,})(?!(?:\d+:)*\d+(?:\.\d+)?\s-+>\s(?:\d+:)*\d+(?:\.\d+)?)""", RegexOption.MULTILINE)
+        private val FIX_SUBTITLE_REGEX = Regex("""$(\n{2,})(?!(?:(?:\d+:)*\d+(?:\.\d+)?\s-+>\s(?:\d+:)*\d+(?:\.\d+)?|(?:NOTE|STYLE|REGION)(?:[ \t\n]|$)|[^\n]+\n(?:(?:\d+:)*\d+(?:\.\d+)?\s-+>\s)))""", RegexOption.MULTILINE)
 
-        private const val PLAYLIST_SEPARATOR = "#EXT-X-STREAM-INF:"
+        /**
+         * Matches a SubRip cue timing line, e.g. `00:00:03,520 --> 00:00:05,240`.
+         *
+         * The hour part is optional, and either a comma or a dot is accepted as the decimal
+         * separator so that partly converted data is matched too. Commas inside dialogue are never
+         * touched, because a match has to contain the `-->` arrow, and anything trailing the end
+         * timestamp (WebVTT cue settings) is left in place.
+         */
+        private val SRT_TIMECODE_REGEX by lazy {
+            Regex("""((?:\d{1,3}:)?\d{1,3}:\d{2})[,.](\d{1,3})[ \t]*-->[ \t]*((?:\d{1,3}:)?\d{1,3}:\d{2})[,.](\d{1,3})""")
+        }
 
-        private val SUBTITLE_REGEX by lazy { Regex("""#EXT-X-MEDIA:TYPE=SUBTITLES.*?NAME="(.*?)".*?URI="(.*?)"""") }
-        private val AUDIO_REGEX by lazy { Regex("""#EXT-X-MEDIA:TYPE=AUDIO.*?NAME="(.*?)".*?URI="(.*?)"""") }
+        /**
+         * Matches a SubRip numeric cue index on its own line, immediately followed by the cue
+         * timing line. Applied after [SRT_TIMECODE_REGEX] has already converted the timings, so
+         * only the dot form needs matching here.
+         */
+        private val SRT_CUE_INDEX_REGEX by lazy {
+            Regex("""^\d+[ \t]*\n(?=(?:\d{1,3}:)?\d{1,3}:\d{2}\.\d{1,3}[ \t]*-->)""", RegexOption.MULTILINE)
+        }
 
-        private val CODECS_REGEX by lazy { Regex("""CODECS="([^"]+)"""") }
-        private val RESOLUTION_REGEX by lazy { Regex("""RESOLUTION=([xX\d]+)""") }
         private val QUALITY_REGEX by lazy { Regex("""[xX](\d+)""") }
-        private val BANDWIDTH_REGEX by lazy { Regex("""BANDWIDTH=(\d+)""") }
 
         private val STANDARD_QUALITIES = listOf(144, 240, 360, 480, 720, 1080, 1440, 2160)
     }

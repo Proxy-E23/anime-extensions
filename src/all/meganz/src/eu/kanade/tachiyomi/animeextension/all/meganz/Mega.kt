@@ -16,8 +16,8 @@ import eu.kanade.tachiyomi.animesource.model.AnimesPage
 import eu.kanade.tachiyomi.animesource.model.SAnime
 import eu.kanade.tachiyomi.animesource.model.SEpisode
 import eu.kanade.tachiyomi.animesource.model.Video
-import eu.kanade.tachiyomi.animesource.online.AnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
+import keiyoushi.utils.AnimeHttpLegacySource
 import keiyoushi.utils.addSwitchPreference
 import keiyoushi.utils.getPreferencesLazy
 import kotlinx.serialization.encodeToString
@@ -26,7 +26,7 @@ import okhttp3.Request
 import okhttp3.Response
 
 class Mega :
-    AnimeHttpSource(),
+    AnimeHttpLegacySource(),
     ConfigurableAnimeSource {
 
     override val name = "MEGA"
