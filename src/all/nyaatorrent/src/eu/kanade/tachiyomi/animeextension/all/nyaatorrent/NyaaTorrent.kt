@@ -229,7 +229,7 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
     // Dos torrents son "el mismo capítulo" si tienen el mismo número de episodio y el resto del
     // título es idéntico (sin el CRC). Si cambia cualquier otra cosa (resolución, audio, grupo) se
     // conservan ambos. Los torrents sin número de episodio claro (batches) nunca se descartan.
-    private data class GroupRequest(val query: String, val mode: Int)
+    private data class GroupRequest(val query: String, val mode: Int, val status: Int)
 
     private data class ReleaseInfo(val episode: Float, val version: Int, val key: String)
 
@@ -242,19 +242,40 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
         Regex("""\b[Ss]\d{1,2}[Ee](\d{1,4})(?:[vV](\d+))?(?![A-Za-z0-9])"""),
     )
 
+    // Sufijo de estado de emisión al final de la búsqueda: "::e" (en emisión), "::c" (completado),
+    // "::d" (desconocido). También se aceptan las letras en inglés: "::o" (ongoing), "::u" (unknown).
+    // Solo se reconoce al final del texto, así un "::" dentro de un título no se toca.
+    private val statusSuffixRegex = Regex("""(?i)\s*::\s*([eocdu])\s*$""")
+
+    private data class StatusSuffix(val query: String, val status: Int?)
+
+    private fun splitStatusSuffix(query: String): StatusSuffix {
+        val match = statusSuffixRegex.find(query) ?: return StatusSuffix(query, null)
+        val status = when (match.groupValues[1].lowercase()) {
+            "e", "o" -> SAnime.ONGOING
+            "c" -> SAnime.COMPLETED
+            else -> SAnime.UNKNOWN
+        }
+        return StatusSuffix(query.substring(0, match.range.first).trim(), status)
+    }
+
     // Un prefijo numerado (group1:/group2:) manda sobre el panel de filtros.
-    // "group:" y la casilla "Agrupar resultados" usan el modo elegido en "Ajustes de agrupación".
-    private fun parseGroupRequest(query: String, filters: AnimeFilterList): GroupRequest? {
+    // "group:" y la casilla "Agrupar resultados" usan el modo elegido en "Modo de agrupación".
+    // El sufijo "::e/::c/::d" manda sobre el filtro "Estado de emisión".
+    private fun parseGroupRequest(rawQuery: String, filters: AnimeFilterList): GroupRequest? {
         val panelMode = filters.filterIsInstance<GroupModeFilter>().firstOrNull()?.state ?: GROUP_MODE_ALL
+        val panelStatus = filters.filterIsInstance<GroupStatusFilter>().firstOrNull()?.state ?: SAnime.UNKNOWN
+        val (query, suffixStatus) = splitStatusSuffix(rawQuery)
+        val status = suffixStatus ?: panelStatus
         val shouldGroup = filters.filterIsInstance<GroupFilter>().firstOrNull()?.state == true && query.isNotEmpty()
         return when {
             query.startsWith(PREFIX_GROUP_LATEST) ->
-                GroupRequest(query.removePrefix(PREFIX_GROUP_LATEST).trim(), GROUP_MODE_LATEST)
+                GroupRequest(query.removePrefix(PREFIX_GROUP_LATEST).trim(), GROUP_MODE_LATEST, status)
             query.startsWith(PREFIX_GROUP_ORIGINAL) ->
-                GroupRequest(query.removePrefix(PREFIX_GROUP_ORIGINAL).trim(), GROUP_MODE_ORIGINAL)
+                GroupRequest(query.removePrefix(PREFIX_GROUP_ORIGINAL).trim(), GROUP_MODE_ORIGINAL, status)
             query.startsWith(PREFIX_GROUP) ->
-                GroupRequest(query.removePrefix(PREFIX_GROUP).trim(), panelMode)
-            shouldGroup -> GroupRequest(query, panelMode)
+                GroupRequest(query.removePrefix(PREFIX_GROUP).trim(), panelMode, status)
+            shouldGroup -> GroupRequest(query, panelMode, status)
             else -> null
         }
     }
@@ -262,6 +283,27 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
     private fun groupModeFromUrl(url: String): Int = url.substringAfter("gmode=", "").substringBefore("&").toIntOrNull()
         ?.takeIf { it in GROUP_MODE_LATEST..GROUP_MODE_ORIGINAL }
         ?: GROUP_MODE_ALL
+
+    private fun groupStatusFromUrl(url: String): Int = url.substringAfter("gstatus=", "").substringBefore("&").toIntOrNull()
+        ?.takeIf { it in SAnime.ONGOING..SAnime.COMPLETED }
+        ?: SAnime.UNKNOWN
+
+    private fun groupStatusLabel(status: Int): String? = when (status) {
+        SAnime.ONGOING -> "Estado: en emisión."
+        SAnime.COMPLETED -> "Estado: completado."
+        else -> null
+    }
+
+    private fun groupStatusSuffix(status: Int): String = when (status) {
+        SAnime.ONGOING -> " ::e"
+        SAnime.COMPLETED -> " ::c"
+        else -> ""
+    }
+
+    // Bloque de texto con el modo y el estado, listo para añadir a una descripción.
+    private fun groupExtraLabels(mode: Int, status: Int): String = listOfNotNull(groupModeLabel(mode), groupStatusLabel(status))
+        .joinToString("\n")
+        .let { if (it.isEmpty()) "" else "\n\n$it" }
 
     private fun groupModeLabel(mode: Int): String? = when (mode) {
         GROUP_MODE_LATEST -> "Modo: priorizar la versión más alta de cada capítulo (v2 sobre v1)."
@@ -343,13 +385,16 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
                 // gmode solo viaja en la URL cuando no es "agrupar todo": así las URLs de los
                 // sintéticos ya guardados (sin gmode) siguen idénticas y se comportan igual.
                 val modeParam = if (groupRequest.mode != GROUP_MODE_ALL) "&gmode=${groupRequest.mode}" else ""
-                val modeLabel = groupModeLabel(groupRequest.mode)?.let { "\n\n$it" }.orEmpty()
+                // gstatus sigue la misma lógica: solo viaja en la URL cuando no es "desconocido".
+                val statusParam = if (groupRequest.status != SAnime.UNKNOWN) "&gstatus=${groupRequest.status}" else ""
+                val extraLabels = groupExtraLabels(groupRequest.mode, groupRequest.status)
                 val seriesTitle = groupTitle(realQuery, encodedQuery, categoryParam)
                 val anime = SAnime.create().apply {
                     title = seriesTitle
-                    url = "/?f=0&c=$categoryParam&s=id&o=desc&q=$encodedQuery&p=1&grouped=1$modeParam"
+                    url = "/?f=0&c=$categoryParam&s=id&o=desc&q=$encodedQuery&p=1&grouped=1$modeParam$statusParam"
                     thumbnail_url = NyaaCovers.groupUrl(groupRequest.mode)
-                    description = "Búsqueda agrupada: \"$realQuery\"\n\nTodos los episodios de todos los torrents que coincidan con esta búsqueda.$modeLabel"
+                    status = groupRequest.status
+                    description = "Búsqueda agrupada: \"$realQuery\"\n\nTodos los episodios de todos los torrents que coincidan con esta búsqueda.$extraLabels"
                 }
                 AnimesPage(listOf(anime), false)
             }
@@ -514,8 +559,10 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
                 GROUP_MODE_ORIGINAL -> PREFIX_GROUP_ORIGINAL
                 else -> PREFIX_GROUP
             }
-            val modeLabel = groupModeLabel(groupMode)?.let { "\n\n$it" }.orEmpty()
-            anime.description = "$modePrefix$query$modeLabel"
+            val groupStatus = groupStatusFromUrl(location)
+            anime.status = groupStatus
+            val extraLabels = groupExtraLabels(groupMode, groupStatus)
+            anime.description = "$modePrefix$query${groupStatusSuffix(groupStatus)}$extraLabels"
         } else {
             val torrentId = location
                 .substringAfter("/view/")
@@ -1343,8 +1390,19 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
 
     private class GroupModeFilter :
         AnimeFilter.Select<String>(
-            "Ajustes de agrupación",
-            arrayOf("Agrupar todo", "Priorizar versión más alta", "Ignorar nuevas versiones"),
+            "Modo de agrupación",
+            arrayOf(
+                "Agrupar todos los episodios",
+                "Priorizar nuevas versiones de un episodio",
+                "Ignorar las nuevas versiones de un episodio",
+            ),
+        )
+
+    // El orden coincide con SAnime.UNKNOWN (0), ONGOING (1) y COMPLETED (2): el índice es el estado.
+    private class GroupStatusFilter :
+        AnimeFilter.Select<String>(
+            "Estado de emisión",
+            arrayOf("Desconocido", "En emisión", "Completado"),
         )
 
     override fun getFilterList(): AnimeFilterList = AnimeFilterList(
@@ -1353,6 +1411,7 @@ class NyaaTorrent(extName: String, private val extURL: String, private val extId
         CategoriesList(availableCategories.map { it.name }.toTypedArray()),
         GroupFilter(),
         GroupModeFilter(),
+        GroupStatusFilter(),
     )
 
     companion object {
