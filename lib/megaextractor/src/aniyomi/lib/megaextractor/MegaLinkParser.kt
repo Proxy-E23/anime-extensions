@@ -5,6 +5,7 @@ package aniyomi.lib.megaextractor
  *
  *  - Archivo legacy:   https://mega.nz/#!<handle>!<key>
  *  - Archivo nuevo:    https://mega.nz/file/<handle>#<key>
+ *  - Archivo embed:    https://mega.nz/embed/<handle>#<key>
  *  - Carpeta legacy:   https://mega.nz/#F!<handle>!<key>
  *  - Carpeta nueva:    https://mega.nz/folder/<handle>#<key>
  *  - Archivo dentro de carpeta:
@@ -12,7 +13,7 @@ package aniyomi.lib.megaextractor
  */
 internal object MegaLinkParser {
 
-    private val FILE_NEW = Regex("""mega\.nz/file/([\w-]+)#([\w-]+)""")
+    private val FILE_NEW = Regex("""mega\.nz/(?:file|embed)/([\w-]+)#([\w-]+)""")
     private val FILE_LEGACY = Regex("""mega\.nz/#!([\w-]+)!([\w-]+)""")
     private val FOLDER_NEW = Regex("""mega\.nz/folder/([\w-]+)#([\w-]+)(?:/file/([\w-]+))?""")
     private val FOLDER_LEGACY = Regex("""mega\.nz/#F!([\w-]+)!([\w-]+)""")

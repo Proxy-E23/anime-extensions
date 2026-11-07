@@ -2,9 +2,14 @@ package eu.kanade.tachiyomi.animeextension.all.meganz
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.graphics.Color
+import android.text.SpannableString
+import android.text.Spanned
+import android.text.style.ForegroundColorSpan
 import android.widget.Toast
 import androidx.preference.EditTextPreference
 import androidx.preference.PreferenceScreen
+import androidx.preference.SwitchPreferenceCompat
 import aniyomi.lib.filenameutils.FilenameUtils
 import aniyomi.lib.megaextractor.MegaApiException
 import aniyomi.lib.megaextractor.MegaExtractor
@@ -44,6 +49,12 @@ class Mega :
     private val extractor by lazy { MegaExtractor(client) }
 
     private var cachedAnimes: List<SAnime>? = null
+
+    // Preferencia del email: se guarda para repintar el estado de la sesión sin reabrir Ajustes.
+    private var emailPref: EditTextPreference? = null
+
+    // Verdadero si la última carga del Cloud Drive falló (posible sesión vencida); pinta el estado en amarillo.
+    private var cloudDriveLoadFailed = false
 
     // Caché en memoria del árbol de cada carpeta ya listada (handle -> nodos
     // descifrados), para no volver a golpear la API ni redescifrar al
@@ -97,7 +108,10 @@ class Mega :
         Thread {
             try {
                 extractor.login(email, password, pin)
+                MegaPreferences.clearCloudCache(preferences)
+                cloudDriveLoadFailed = false
                 cachedAnimes = null // para que el Cloud Drive aparezca (o desaparezca) en el catálogo
+                refreshSessionSummary()
                 showToast("Sesión de MEGA iniciada como $email.")
             } catch (e: MegaApiException) {
                 when (e.code) {
@@ -130,68 +144,116 @@ class Mega :
 
         val animeList = mutableListOf<SAnime>()
 
-        if (extractor.isLoggedIn()) {
-            animeList += buildCloudDriveAnimeList()
+        // Un fallo del Cloud Drive (sesión vencida, red) no debe tumbar los
+        // enlaces guardados: se muestra un aviso y no se guarda el resultado
+        // en memoria, para reintentar la próxima vez que se abra el catálogo.
+        var cacheable = true
+        if (MegaPreferences.showCloudDrive(preferences) && extractor.isLoggedIn()) {
+            try {
+                animeList += loadCloudDriveAnimes()
+                cloudDriveLoadFailed = false
+            } catch (e: Exception) {
+                cloudDriveLoadFailed = true
+                cacheable = false
+                animeList += cloudDriveErrorAnime(e.message)
+            }
         }
 
-        MegaPreferences.getEntries(preferences).forEach { entry ->
-            val link = extractor.parseLink(entry.url)
-            if (link == null) return@forEach
+        animeList += buildEntryAnimes(MegaPreferences.getEntries(preferences))
+
+        if (cacheable) cachedAnimes = animeList
+        return AnimesPage(animeList, false)
+    }
+
+    /**
+     * Enlaces guardados. Las carpetas marcadas como completadas se comprueban
+     * una sola vez y se recuerdan en disco; las demás (en emisión o
+     * desconocido) se comprueban una vez por sesión. Los archivos únicos no
+     * piden nada al construirse, así que no necesitan caché.
+     */
+    private fun buildEntryAnimes(entries: List<MegaPreferences.Entry>): List<SAnime> {
+        val verified = MegaPreferences.readVerifiedFolders(preferences)
+        val newVerified = mutableSetOf<String>()
+        val results = mutableListOf<SAnime>()
+
+        entries.forEach { entry ->
+            val link = extractor.parseLink(entry.url) ?: return@forEach
 
             when (link) {
                 is MegaLink.File -> {
-                    animeList += buildSingleFileAnime(entry.name, entry.url)
+                    results += buildSingleFileAnime(entry.name, entry.url, status = entry.status)
                 }
+
                 is MegaLink.Folder -> {
-                    animeList += buildFolderAnime(entry.name, entry.url, link)
+                    val completed = entry.status == SAnime.COMPLETED
+                    if (completed && entry.url in verified) {
+                        newVerified += entry.url
+                        results += folderAnime(entry)
+                    } else {
+                        val alive = isFolderAlive(link)
+                        results += if (alive) folderAnime(entry) else deletedFolderAnime(entry)
+                        // Una carpeta que falló (borrada o error de red) nunca se guarda como verificada.
+                        if (completed && alive) newVerified += entry.url
+                    }
                 }
             }
         }
 
-        cachedAnimes = animeList
-        return AnimesPage(animeList, false)
+        // Poda: solo quedan en disco las carpetas que siguen guardadas y completadas.
+        if (newVerified != verified) MegaPreferences.writeVerifiedFolders(preferences, newVerified)
+        return results
     }
 
     /**
      * El nombre real de un archivo único se resuelve de forma perezosa en
      * getAnimeDetails, igual que hacen Drive/MediaFire.
      */
-    private fun buildSingleFileAnime(entryName: String, entryUrl: String, sizeLabel: String? = null): SAnime = SAnime.create().apply {
+    private fun buildSingleFileAnime(
+        entryName: String,
+        entryUrl: String,
+        sizeLabel: String? = null,
+        status: Int = SAnime.UNKNOWN,
+    ): SAnime = SAnime.create().apply {
         title = entryName
         url = MegaLinkData(entryUrl, "single", sizeLabel?.let { MegaLinkDataInfo(entryName, it) }).toJsonString()
         thumbnail_url = ""
         description = removeEntryHint(entryName, entryUrl)
+        this.status = status
     }
 
     /**
-     * Se intenta listar la carpeta de una vez para detectar si fue eliminada
-     * (entrada "fantasma" con instrucciones de borrado) o si tiene contenido
-     * válido.
+     * Lista la carpeta para detectar si fue eliminada (entrada "fantasma" con
+     * instrucciones de borrado) o si sigue viva. De paso deja los nodos en
+     * [nodeCache] para el resto de la sesión.
      */
-    private fun buildFolderAnime(entryName: String, entryUrl: String, link: MegaLink.Folder): SAnime {
-        val nodes = try {
-            extractor.listFolder(link).also { nodeCache[link.handle] = it }
-        } catch (e: Exception) {
-            return SAnime.create().apply {
-                title = "❌ $entryName (Carpeta eliminada o inválida)"
-                thumbnail_url = "https://http.cat/404"
-                url = MegaLinkData(
-                    entryUrl,
-                    "error404",
-                    MegaLinkDataInfo(entryName, entryUrl),
-                ).toJsonString()
-                status = SAnime.UNKNOWN
-                description = "Esta carpeta fue eliminada o el link ya no es válido.\n\n" + removeEntryHint(entryName, entryUrl)
-            }
-        }
-
-        return SAnime.create().apply {
-            title = entryName
-            url = MegaLinkData(entryUrl, "multi").toJsonString()
-            thumbnail_url = ""
-            description = removeEntryHint(entryName, entryUrl)
-        }
+    private fun isFolderAlive(link: MegaLink.Folder): Boolean = try {
+        extractor.listFolder(link).also { nodeCache[link.handle] = it }
+        true
+    } catch (e: Exception) {
+        false
     }
+
+    private fun folderAnime(entry: MegaPreferences.Entry): SAnime = SAnime.create().apply {
+        title = entry.name
+        url = MegaLinkData(entry.url, "multi").toJsonString()
+        thumbnail_url = ""
+        description = removeEntryHint(entry.name, entry.url)
+        status = entry.status
+    }
+
+    private fun deletedFolderAnime(entry: MegaPreferences.Entry): SAnime = SAnime.create().apply {
+        title = "❌ ${entry.name} (Carpeta eliminada o inválida)"
+        thumbnail_url = "https://http.cat/404"
+        url = MegaLinkData(
+            entry.url,
+            "error404",
+            MegaLinkDataInfo(entry.name, entry.url),
+        ).toJsonString()
+        status = SAnime.UNKNOWN
+        description = "Esta carpeta fue eliminada o el link ya no es válido.\n\n" + removeEntryHint(entry.name, entry.url)
+    }
+
+    private fun buildFolderAnime(entry: MegaPreferences.Entry, link: MegaLink.Folder): SAnime = if (isFolderAlive(link)) folderAnime(entry) else deletedFolderAnime(entry)
 
     /**
      * Texto reutilizado en la descripción de cada entrada para poder
@@ -203,17 +265,31 @@ class Mega :
 
     /**
      * Entradas sintéticas del Cloud Drive de la cuenta logueada -- no vienen
-     * de un link pegado a mano, así que a diferencia de [buildFolderAnime] si
-     * falla el listado (sesión vencida, error de red) se omiten en silencio
-     * en vez de mostrar una entrada de error: el usuario no las agregó a
-     * propósito, y el estado real de la sesión ya se ve en Ajustes.
-     *
-     * Se genera una entrada por cada CARPETA DE PRIMER NIVEL del Cloud Drive
-     * (antes se juntaba todo en una sola entrada "Mi Cloud Drive"), más una
-     * entrada aparte para los videos que estén sueltos directo en la raíz
-     * (fuera de cualquier carpeta), si los hay. Subcarpetas anidadas dentro
-     * de una carpeta de primer nivel se aplanan: sus videos se listan como
-     * episodios de esa misma entrada, sin crear más niveles.
+     * de un link pegado a mano. La estructura se lee de MEGA una sola vez y
+     * se guarda en disco: después se muestra al instante, sin pedir nada,
+     * hasta que se pulse "Recargar mi Cloud Drive" en Ajustes o cambie la
+     * cuenta. Si la lectura falla, se lanza la excepción para que
+     * [getPopularAnime] muestre un aviso y no guarde nada.
+     */
+    private fun loadCloudDriveAnimes(): List<SAnime> {
+        val email = extractor.loggedInEmail() ?: return emptyList()
+
+        MegaPreferences.readCloudCache(preferences, email)?.let { cached ->
+            return cached.map { cloudAnime(it, email) }
+        }
+
+        val entries = buildCloudDriveEntries()
+        // Un Drive vacío no se guarda: podría ser una lectura fallida y así se reintenta.
+        if (entries.isNotEmpty()) MegaPreferences.writeCloudCache(preferences, email, entries)
+        return entries.map { cloudAnime(it, email) }
+    }
+
+    /**
+     * Se genera una entrada por cada CARPETA DE PRIMER NIVEL del Cloud Drive,
+     * más una entrada aparte para los videos que estén sueltos directo en la
+     * raíz (fuera de cualquier carpeta), si los hay. Subcarpetas anidadas
+     * dentro de una carpeta de primer nivel se aplanan: sus videos se listan
+     * como episodios de esa misma entrada, sin crear más niveles.
      *
      * Una carpeta es "de primer nivel" si su padre no es, a su vez, otra
      * carpeta de la lista -- es decir, cuelga directo de la raíz del Cloud
@@ -221,40 +297,52 @@ class Mega :
      * tipo ROOT ya viene descartado desde MegaApi.listCloudDrive): alcanza
      * con ver que ningún nodo tiene ese handle como propio.
      */
-    private fun buildCloudDriveAnimeList(): List<SAnime> {
-        val email = extractor.loggedInEmail() ?: return emptyList()
-        val nodes = try {
-            extractor.listCloudDrive().also { nodeCache[CLOUD_DRIVE_HANDLE] = it }
-        } catch (e: Exception) {
-            return emptyList()
-        }
+    private fun buildCloudDriveEntries(): List<MegaPreferences.CloudEntry> {
+        val nodes = extractor.listCloudDrive().also { nodeCache[CLOUD_DRIVE_HANDLE] = it }
 
         val folderHandles = nodes.filter { it.isFolder }.map { it.handle }.toSet()
         val topLevelFolders = nodes.filter { it.isFolder && it.parentHandle !in folderHandles }
         val rootLooseVideos = nodes.filter { !it.isFolder && it.parentHandle !in folderHandles && isVideoName(it.name) }
 
-        val animeList = mutableListOf<SAnime>()
+        val entries = mutableListOf<MegaPreferences.CloudEntry>()
 
         topLevelFolders.forEach { folder ->
-            animeList += SAnime.create().apply {
-                title = "☁️ ${folder.name}"
-                url = MegaLinkData("https://mega.nz/fm", "cloud_folder", folderHandle = folder.handle).toJsonString()
-                thumbnail_url = ""
-                description = "Carpeta de tu Cloud Drive de MEGA (cuenta: $email)."
-            }
+            entries += MegaPreferences.CloudEntry(
+                title = "☁️ ${folder.name}",
+                url = MegaLinkData("https://mega.nz/fm", "cloud_folder", folderHandle = folder.handle).toJsonString(),
+                isRoot = false,
+            )
         }
 
         if (rootLooseVideos.isNotEmpty()) {
-            animeList += SAnime.create().apply {
-                title = "☁️ Mi Cloud Drive (raíz)"
-                url = MegaLinkData("https://mega.nz/fm", "cloud").toJsonString()
-                thumbnail_url = ""
-                description = "Videos sueltos en la raíz de tu Cloud Drive de MEGA (cuenta: $email), " +
-                    "fuera de cualquier carpeta."
-            }
+            entries += MegaPreferences.CloudEntry(
+                title = "☁️ Mi Cloud Drive (raíz)",
+                url = MegaLinkData("https://mega.nz/fm", "cloud").toJsonString(),
+                isRoot = true,
+            )
         }
 
-        return animeList
+        return entries
+    }
+
+    private fun cloudAnime(entry: MegaPreferences.CloudEntry, email: String): SAnime = SAnime.create().apply {
+        title = entry.title
+        url = entry.url
+        thumbnail_url = ""
+        description = if (entry.isRoot) {
+            "Videos sueltos en la raíz de tu Cloud Drive de MEGA (cuenta: $email), fuera de cualquier carpeta."
+        } else {
+            "Carpeta de tu Cloud Drive de MEGA (cuenta: $email)."
+        }
+    }
+
+    private fun cloudDriveErrorAnime(message: String?): SAnime = SAnime.create().apply {
+        title = "⚠️ Cloud Drive: no se pudo cargar"
+        url = MegaLinkData("https://mega.nz/fm", "cloud_error").toJsonString()
+        thumbnail_url = ""
+        status = SAnime.UNKNOWN
+        description = (message ?: "Error desconocido") +
+            "\n\nRevisa que la sesión de MEGA siga activa en Ajustes de la extensión y vuelve a abrir el catálogo."
     }
 
     // ── Búsqueda + Filtros (agregar nuevo enlace) ──────────────────────────
@@ -265,6 +353,7 @@ class Mega :
     override suspend fun getSearchAnime(page: Int, query: String, filters: AnimeFilterList): AnimesPage {
         val urlFilter = filters.filterIsInstance<UrlFilter>().firstOrNull()
         val nameFilter = filters.filterIsInstance<NameFilter>().firstOrNull()
+        val statusFilter = filters.filterIsInstance<StatusFilter>().firstOrNull()
         val rawUrl = urlFilter?.state?.trim() ?: ""
 
         if (rawUrl.isNotBlank()) {
@@ -287,12 +376,13 @@ class Mega :
                     is MegaLink.Folder -> link.handle
                 }
 
-            MegaPreferences.addEntry(preferences, resolvedName, rawUrl)
+            val entry = MegaPreferences.Entry(resolvedName, rawUrl, statusFilter?.state ?: SAnime.UNKNOWN)
+            MegaPreferences.addEntry(preferences, entry.name, entry.url, entry.status)
             cachedAnimes = null
 
             val anime = when (link) {
-                is MegaLink.File -> buildSingleFileAnime(resolvedName, rawUrl, sizeLabel)
-                is MegaLink.Folder -> buildFolderAnime(resolvedName, rawUrl, link)
+                is MegaLink.File -> buildSingleFileAnime(entry.name, entry.url, sizeLabel, entry.status)
+                is MegaLink.Folder -> buildFolderAnime(entry, link)
             }
             return AnimesPage(listOf(anime), false)
         }
@@ -307,6 +397,7 @@ class Mega :
         SeparatorFilter(),
         UrlFilter(),
         NameFilter(),
+        StatusFilter(),
         SeparatorFilter(),
         InfoFilter("Deja los campos vacíos para buscar por nombre entre tus enlaces guardados"),
     )
@@ -347,6 +438,12 @@ class Mega :
             }
             "single", "multi" -> anime.apply {
                 description = removeEntryHint(anime.title, parsed.url)
+                // El estado se lee siempre de las entradas guardadas para reflejar cambios hechos en Ajustes.
+                MegaPreferences.findByUrl(preferences, parsed.url)?.let { status = it.status }
+            }
+            "cloud_error" -> anime.apply {
+                description = "No se pudo cargar tu Cloud Drive.\n\n" +
+                    "Revisa que la sesión de MEGA siga activa en Ajustes de la extensión y vuelve a abrir el catálogo."
             }
             else -> anime
         }
@@ -360,7 +457,7 @@ class Mega :
     override suspend fun getEpisodeList(anime: SAnime): List<SEpisode> {
         val parsed = json.decodeFromString<MegaLinkData>(anime.url)
 
-        if (parsed.type == "error404") return emptyList()
+        if (parsed.type == "error404" || parsed.type == "cloud_error") return emptyList()
 
         if (parsed.type == "single") {
             val link = extractor.parseLink(parsed.url) as? MegaLink.File ?: return emptyList()
@@ -413,7 +510,7 @@ class Mega :
                 nodes.filter { !it.isFolder && isDescendantOf(it, folderHandle) }
             } else {
                 // "cloud": solo videos sueltos directo en la raíz, fuera de
-                // cualquier carpeta (mismo criterio que buildCloudDriveAnimeList).
+                // cualquier carpeta (mismo criterio que buildCloudDriveEntries).
                 nodes.filter { !it.isFolder && it.parentHandle !in folderHandles }
             }
 
@@ -554,6 +651,66 @@ class Mega :
 
     // ── Preferencias ──────────────────────────────────────────────────────────
 
+    /**
+     * Estado de la sesión para el campo del email, con color:
+     *  - verde: hay una sesión guardada en el dispositivo;
+     *  - amarillo: hay sesión, pero la última carga del Cloud Drive falló (puede haber vencido);
+     *  - rojo: no hay sesión.
+     * "Verde" significa que la sesión existe localmente: MEGA solo confirma que sigue válida
+     * cuando se le hace una petición, por eso el amarillo se activa a partir de un fallo real.
+     */
+    private fun sessionSummary(): CharSequence {
+        val email = extractor.loggedInEmail()
+        return if (email != null) {
+            val prefix = "Sesión iniciada como: "
+            val warning = if (cloudDriveLoadFailed) {
+                "\n⚠️ No se pudo cargar tu Cloud Drive: la sesión podría haber vencido. " +
+                    "Si se repite, cierra sesión e inicia de nuevo."
+            } else {
+                ""
+            }
+            val color = if (cloudDriveLoadFailed) COLOR_SESSION_WARNING else COLOR_SESSION_OK
+            SpannableString(prefix + email + warning).apply {
+                setSpan(ForegroundColorSpan(color), prefix.length, length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            }
+        } else {
+            val status = "Sin sesión iniciada."
+            val help = " Escribe tu email y después tu contraseña (abajo) para iniciar sesión."
+            SpannableString(status + help).apply {
+                setSpan(ForegroundColorSpan(COLOR_SESSION_ERROR), 0, status.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            }
+        }
+    }
+
+    private fun refreshSessionSummary() {
+        android.os.Handler(android.os.Looper.getMainLooper()).post { emailPref?.summary = sessionSummary() }
+    }
+
+    /**
+     * Botón de acción en Ajustes. Este proyecto no ofrece la clase Preference simple,
+     * así que se usa un interruptor que ejecuta la acción al pulsarlo y rechaza el
+     * cambio (devuelve false) para quedarse siempre apagado. No pide confirmación:
+     * se usa solo para acciones inofensivas (recargar cachés, detener el servidor).
+     */
+    private fun actionPreference(
+        screen: PreferenceScreen,
+        prefKey: String,
+        prefTitle: String,
+        prefSummary: String,
+        toastText: String,
+        action: () -> Unit,
+    ): SwitchPreferenceCompat = SwitchPreferenceCompat(screen.context).apply {
+        key = prefKey
+        title = prefTitle
+        summary = prefSummary
+        setDefaultValue(false)
+        setOnPreferenceChangeListener { _, _ ->
+            action()
+            Toast.makeText(screen.context, toastText, Toast.LENGTH_SHORT).show()
+            false
+        }
+    }
+
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         screen.addSwitchPreference(
             key = MegaPreferences.PREF_SHOW_FILENAME,
@@ -562,91 +719,6 @@ class Mega :
             summary = "Activado: muestra el nombre real del archivo.\nDesactivado: muestra \"Episodio 1\", \"Episodio 2\"…",
         )
 
-        EditTextPreference(screen.context).apply {
-            key = MegaPreferences.PREF_MEGA_EMAIL
-            title = "Cuenta de MEGA (opcional) — Email"
-            summary = extractor.loggedInEmail()?.let { "Sesión iniciada como: $it" }
-                ?: "Sin sesión iniciada. Escribe tu email y después tu contraseña (abajo) para iniciar sesión."
-            dialogTitle = "Email de MEGA"
-            setDialogMessage(
-                "Si inicias sesión, esta extensión y cualquier otra que use la misma librería " +
-                    "descargan con la cuota de ancho de banda de tu cuenta en vez de la anónima -- " +
-                    "útil sobre todo para video de mayor resolución o peso. Es opcional: sin sesión, " +
-                    "todo sigue funcionando igual que antes.",
-            )
-            setDefaultValue("")
-        }.also(screen::addPreference)
-
-        EditTextPreference(screen.context).apply {
-            key = "meganz_account_password_input"
-            title = "Contraseña de MEGA"
-            summary = "Escribe aquí tu contraseña para iniciar sesión con el email de arriba. No se guarda: se usa una sola vez. " +
-                "Si tu cuenta tiene verificación en dos pasos, agrega \"::\" y el código (ejemplo: tucontraseña::123456)."
-            dialogTitle = "Contraseña de MEGA"
-            setDialogMessage(
-                "Se usa una sola vez para iniciar sesión. No queda guardada en ningún lado. Si tu cuenta " +
-                    "tiene verificación en dos pasos activada, escribe la contraseña seguida de \"::\" y el " +
-                    "código de verificación, por ejemplo: tucontraseña::123456",
-            )
-            setDefaultValue("")
-            setOnPreferenceChangeListener { _, newValue ->
-                val email = MegaPreferences.getSavedEmail(preferences)
-                val raw = (newValue as String).trim()
-                val hasCode = raw.contains("::")
-                val password = if (hasCode) raw.substringBeforeLast("::") else raw
-                val pin = if (hasCode) raw.substringAfterLast("::").trim().ifBlank { null } else null
-                attemptLogin(screen.context, email, password, pin)
-                false // ni la contraseña ni el código de 2FA se persisten
-            }
-        }.also(screen::addPreference)
-
-        EditTextPreference(screen.context).apply {
-            key = "meganz_account_logout_button"
-            title = "Cerrar sesión de MEGA"
-            summary = "Cierra la sesión para esta y para todas las extensiones que usan la misma librería."
-            dialogTitle = "Cerrar sesión de MEGA"
-            setDialogMessage(
-                "El cuadro de texto no se usa: toca Aceptar para cerrar sesión ahora, o Cancelar para no hacer nada.",
-            )
-            setOnPreferenceChangeListener { _, _ ->
-                extractor.logout()
-                nodeCache.remove(CLOUD_DRIVE_HANDLE)
-                cachedAnimes = null
-                Toast.makeText(screen.context, "Sesión de MEGA cerrada.", Toast.LENGTH_SHORT).show()
-                false
-            }
-        }.also(screen::addPreference)
-
-        EditTextPreference(screen.context).apply {
-            // key dummy: no se persiste nada real, pero EditTextPreference
-            // la requiere no-nula.
-            key = "meganz_stop_proxy_button"
-            title = "Detener servidor de MEGA"
-            summary = "El servidor local que descifra y sirve los videos de MEGA se queda " +
-                "corriendo en segundo plano mientras la app esté abierta (el costo de " +
-                "dejarlo así es mínimo). Si prefieres apagarlo manualmente en vez de " +
-                "esperar a cerrar la app, toca aquí. Si estás reproduciendo algo ahora " +
-                "mismo, se cortará."
-            setDialogTitle("Detener servidor de MEGA")
-            setDialogMessage(
-                "El cuadro de texto no se usa: toca Aceptar para detener el servidor " +
-                    "ahora, o Cancelar para no hacer nada.",
-            )
-            // Se reutiliza EditTextPreference como confirmación
-            // (Aceptar/Cancelar); el texto tecleado se ignora.
-            // onPreferenceChangeListener solo dispara con Aceptar, y
-            // retorna false para no persistir nada.
-            setOnPreferenceChangeListener { _, _ ->
-                extractor.shutdown()
-                Toast.makeText(
-                    screen.context,
-                    "Servidor de MEGA detenido.",
-                    Toast.LENGTH_SHORT,
-                ).show()
-                false
-            }
-        }.also(screen::addPreference)
-
         val folderListPref = EditTextPreference(screen.context).apply {
             key = MegaPreferences.PREF_KEY
             title = "Enlaces guardados"
@@ -654,6 +726,11 @@ class Mega :
             dialogTitle = "Enlaces guardados"
             setDialogMessage(
                 "Una entrada por línea.\n\nEjemplo:\nNombre::URL de MEGA\n\n" +
+                    "Para indicar el estado de emisión, agrega al final ::e (en emisión), " +
+                    "::c (completado) o ::d (desconocido).\n" +
+                    "Ejemplo: Mi anime::https://mega.nz/folder/abc#clave::c\n\n" +
+                    "Las carpetas marcadas como completadas se comprueban una sola vez; si una se elimina " +
+                    "o cambia, usa \"Refrescar enlaces guardados\".\n\n" +
                     "Para eliminar una entrada, borra la línea completa.\n\n" +
                     "Para ver los cambios reflejados en el catálogo, cierra y vuelve a abrir la extensión.",
             )
@@ -695,9 +772,129 @@ class Mega :
             }
         }
         screen.addPreference(removeEntryPref)
+
+        screen.addPreference(
+            actionPreference(
+                screen = screen,
+                prefKey = "meganz_refresh_saved_links",
+                prefTitle = "Refrescar enlaces guardados",
+                prefSummary = "Las carpetas en emisión o desconocidas se comprueban al abrir Anikku; las completadas " +
+                    "se recuerdan. Esto fuerza una nueva comprobación de todas, completadas incluidas.",
+                toastText = "Los enlaces se comprobarán al abrir el catálogo",
+            ) {
+                MegaPreferences.clearVerifiedFolders(preferences)
+                cachedAnimes = null
+            },
+        )
+
+        EditTextPreference(screen.context).apply {
+            key = MegaPreferences.PREF_MEGA_EMAIL
+            title = "Cuenta de MEGA (opcional) — Email"
+            summary = sessionSummary()
+            dialogTitle = "Email de MEGA"
+            setDialogMessage(
+                "Si inicias sesión, esta extensión y cualquier otra que use la misma librería " +
+                    "descargan con la cuota de ancho de banda de tu cuenta en vez de la anónima -- " +
+                    "útil sobre todo para video de mayor resolución o peso. Es opcional: sin sesión, " +
+                    "todo sigue funcionando igual que antes.",
+            )
+            setDefaultValue("")
+            emailPref = this
+        }.also(screen::addPreference)
+
+        EditTextPreference(screen.context).apply {
+            key = "meganz_account_password_input"
+            title = "Contraseña de MEGA"
+            summary = "Escribe aquí tu contraseña para iniciar sesión con el email de arriba. No se guarda: se usa una sola vez. " +
+                "Si tu cuenta tiene verificación en dos pasos, agrega \"::\" y el código (ejemplo: tucontraseña::123456)."
+            dialogTitle = "Contraseña de MEGA"
+            setDialogMessage(
+                "Se usa una sola vez para iniciar sesión. No queda guardada en ningún lado. Si tu cuenta " +
+                    "tiene verificación en dos pasos activada, escribe la contraseña seguida de \"::\" y el " +
+                    "código de verificación, por ejemplo: tucontraseña::123456",
+            )
+            setDefaultValue("")
+            setOnPreferenceChangeListener { _, newValue ->
+                val email = MegaPreferences.getSavedEmail(preferences)
+                val raw = (newValue as String).trim()
+                val hasCode = raw.contains("::")
+                val password = if (hasCode) raw.substringBeforeLast("::") else raw
+                val pin = if (hasCode) raw.substringAfterLast("::").trim().ifBlank { null } else null
+                attemptLogin(screen.context, email, password, pin)
+                false // ni la contraseña ni el código de 2FA se persisten
+            }
+        }.also(screen::addPreference)
+
+        SwitchPreferenceCompat(screen.context).apply {
+            key = MegaPreferences.PREF_SHOW_CLOUD_DRIVE
+            title = "Mostrar mi Cloud Drive en el catálogo"
+            summary = "Solo se usa si hay una sesión de MEGA iniciada. Apagado: no se pide nada de tu cuenta al abrir el catálogo."
+            setDefaultValue(true)
+            setOnPreferenceChangeListener { _, _ ->
+                cachedAnimes = null
+                true
+            }
+        }.also(screen::addPreference)
+
+        screen.addPreference(
+            actionPreference(
+                screen = screen,
+                prefKey = "meganz_reload_cloud_drive",
+                prefTitle = "Recargar mi Cloud Drive",
+                prefSummary = "Vuelve a leer tus carpetas la próxima vez que abras el catálogo. " +
+                    "Úsalo si creaste, moviste o renombraste carpetas en tu Cloud Drive.",
+                toastText = "Tu Cloud Drive se recargará al abrir el catálogo",
+            ) {
+                MegaPreferences.clearCloudCache(preferences)
+                nodeCache.remove(CLOUD_DRIVE_HANDLE)
+                cachedAnimes = null
+            },
+        )
+
+        EditTextPreference(screen.context).apply {
+            key = "meganz_account_logout_button"
+            title = "Cerrar sesión de MEGA"
+            summary = "Cierra la sesión para esta y para todas las extensiones que usan la misma librería."
+            dialogTitle = "Cerrar sesión de MEGA"
+            setDialogMessage(
+                "El cuadro de texto no se usa: toca Aceptar para cerrar sesión ahora, o Cancelar para no hacer nada.",
+            )
+            setOnPreferenceChangeListener { _, _ ->
+                extractor.logout()
+                cloudDriveLoadFailed = false
+                refreshSessionSummary()
+                MegaPreferences.clearCloudCache(preferences)
+                nodeCache.remove(CLOUD_DRIVE_HANDLE)
+                cachedAnimes = null
+                Toast.makeText(screen.context, "Sesión de MEGA cerrada.", Toast.LENGTH_SHORT).show()
+                false
+            }
+        }.also(screen::addPreference)
+
+        screen.addPreference(
+            actionPreference(
+                screen = screen,
+                // Key nueva a propósito: la anterior ("meganz_stop_proxy_button") ya tenía un texto guardado
+                // del antiguo cuadro de diálogo, y leerlo como booleano hacía crashear Ajustes.
+                prefKey = "meganz_stop_proxy_action",
+                prefTitle = "Detener servidor de MEGA",
+                prefSummary = "El servidor local que descifra y sirve los videos de MEGA se queda " +
+                    "corriendo en segundo plano mientras la app esté abierta (el costo de " +
+                    "dejarlo así es mínimo). Si prefieres apagarlo manualmente en vez de " +
+                    "esperar a cerrar la app, actívalo aquí. Si estás reproduciendo algo ahora " +
+                    "mismo, se cortará.",
+                toastText = "Servidor de MEGA detenido.",
+            ) {
+                extractor.shutdown()
+            },
+        )
     }
 
     companion object {
+        private val COLOR_SESSION_OK = Color.parseColor("#4CAF50")
+        private val COLOR_SESSION_WARNING = Color.parseColor("#FFC107")
+        private val COLOR_SESSION_ERROR = Color.parseColor("#F44336")
+
         private val VIDEO_EXTENSIONS = setOf("mp4", "mkv", "avi", "mov", "webm", "m4v", "flv", "wmv", "ts", "m2ts")
 
         // Key sentinela para nodeCache: un handle real de MEGA siempre tiene

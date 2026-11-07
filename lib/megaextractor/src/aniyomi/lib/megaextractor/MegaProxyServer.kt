@@ -5,14 +5,13 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.nanohttpd.protocols.http.IHTTPSession
 import org.nanohttpd.protocols.http.NanoHTTPD
+import org.nanohttpd.protocols.http.request.Method
 import org.nanohttpd.protocols.http.response.Response
 import org.nanohttpd.protocols.http.response.Response.newFixedLengthResponse
 import org.nanohttpd.protocols.http.response.Status
-import java.io.PipedInputStream
-import java.io.PipedOutputStream
-import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.ConcurrentLinkedDeque
-import java.util.concurrent.Executors
+import java.io.ByteArrayInputStream
+import java.util.Collections
+import java.util.UUID
 import java.util.concurrent.TimeUnit
 
 /**
@@ -22,8 +21,10 @@ import java.util.concurrent.TimeUnit
  * offset exacto pedido, y responde como un servidor HTTP normal con soporte
  * de `Range`, que es indispensable para que el reproductor pueda hacer seek.
  *
- * Una instancia de este servidor puede servir múltiples streams a la vez;
- * cada uno se registra con [registerStream] y obtiene una URL local propia.
+ * Solo escucha en loopback (127.0.0.1): nadie más en la red local puede
+ * conectarse. Cada stream se registra con [registerStream], que devuelve un
+ * token aleatorio (UUID) imposible de adivinar; la URL local se arma con
+ * [urlFor]. Puede servir múltiples streams a la vez.
  *
  * No se auto-apaga por inactividad: el costo de dejarlo corriendo es
  * mínimo, y cualquier heurística basada en tráfico podría cortar una
@@ -32,9 +33,14 @@ import java.util.concurrent.TimeUnit
 internal class MegaProxyServer(
     private val client: OkHttpClient,
     port: Int = 0,
-) : NanoHTTPD(port) {
+) : NanoHTTPD("127.0.0.1", port) {
 
     private val tag = "MegaProxyServer"
+
+    private companion object {
+        // Streams recientes que se conservan (LRU por acceso).
+        const val MAX_STREAMS = 64
+    }
 
     data class StreamInfo(
         val downloadUrl: String,
@@ -44,38 +50,30 @@ internal class MegaProxyServer(
         val mimeType: String = "video/mp4",
     )
 
-    private val streams = ConcurrentHashMap<String, StreamInfo>()
-    private val ioExecutor = Executors.newCachedThreadPool()
+    // Streams registrados en orden de ACCESO (LRU), no de registro: cada Range
+    // que pide el reproductor deja ese stream como el más reciente, así el que
+    // se está reproduciendo nunca es el que se descarta al registrar otros.
+    private val streams = Collections.synchronizedMap(
+        object : LinkedHashMap<String, StreamInfo>(16, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, StreamInfo>): Boolean = size > MAX_STREAMS
+        },
+    )
 
     val localPort: Int
         get() = super.getListeningPort()
 
-    // Orden de registro de streamId vivos. Nadie llama unregisterStream hoy,
-    // así que sin este límite `streams` crecería para siempre. Se asume que
-    // solo hay un episodio activo a la vez, salvo un margen chico para
-    // cubrir el caso de pedir dos calidades casi seguidas del mismo episodio.
-    private val registrationOrder = ConcurrentLinkedDeque<String>()
-    private val maxRecentStreams = 2
-
-    @Synchronized
-    fun registerStream(streamId: String, info: StreamInfo) {
-        streams[streamId] = info
-        registrationOrder.remove(streamId) // evita duplicar si se re-registra el mismo id
-        registrationOrder.addLast(streamId)
-
-        while (registrationOrder.size > maxRecentStreams) {
-            val oldest = registrationOrder.pollFirst() ?: break
-            streams.remove(oldest)
-        }
+    /** Registra el stream y devuelve su token aleatorio (úsalo con [urlFor]). */
+    fun registerStream(info: StreamInfo): String {
+        val token = UUID.randomUUID().toString()
+        streams[token] = info
+        return token
     }
 
-    @Synchronized
-    fun unregisterStream(streamId: String) {
-        streams.remove(streamId)
-        registrationOrder.remove(streamId)
+    fun unregisterStream(token: String) {
+        streams.remove(token)
     }
 
-    fun urlFor(streamId: String): String = "http://127.0.0.1:$localPort/stream/$streamId"
+    fun urlFor(token: String): String = "http://127.0.0.1:$localPort/stream/$token"
 
     override fun start() {
         try {
@@ -85,11 +83,6 @@ internal class MegaProxyServer(
             Log.e(tag, "No se pudo iniciar MegaProxyServer: ${e.message}")
             throw e
         }
-    }
-
-    override fun stop() {
-        super.stop()
-        ioExecutor.shutdownNow()
     }
 
     override fun handle(session: IHTTPSession): Response {
@@ -102,47 +95,75 @@ internal class MegaProxyServer(
         val info = streams[streamId]
             ?: return newFixedLengthResponse(Status.NOT_FOUND, "text/plain", "Stream no registrado: $streamId")
 
-        val rangeHeader = session.headers["range"]
-        val (start, end) = parseRange(rangeHeader, info.totalSize) ?: run {
-            Log.w(tag, "Rango inválido pedido para stream $streamId: Range=$rangeHeader (totalSize=${info.totalSize})")
-            val invalidRangeResponse = newFixedLengthResponse(Status.RANGE_NOT_SATISFIABLE, "text/plain", "Rango inválido")
-            invalidRangeResponse.addHeader("Content-Range", "bytes */${info.totalSize}")
-            return invalidRangeResponse
+        val method = session.method
+        if (method != Method.GET && method != Method.HEAD) {
+            return newFixedLengthResponse(Status.METHOD_NOT_ALLOWED, "text/plain", "Usa GET o HEAD")
         }
 
-        return try {
-            serveRange(info, start, end)
-        } catch (e: Exception) {
-            Log.e(tag, "Error sirviendo stream $streamId: ${e.message}", e)
-            newFixedLengthResponse(Status.INTERNAL_ERROR, "text/plain", "Error: ${e.message}")
+        // Solo se respeta un único rango "bytes=". Cualquier otra cosa (otra
+        // unidad, o varios rangos separados por coma) se ignora y se sirve el
+        // archivo completo con 200, que es lo que permite el RFC 9110.
+        val rangeHeader = session.headers["range"]?.takeIf { it.startsWith("bytes=") && ',' !in it }
+        val isRangeRequest = rangeHeader != null
+        val range = if (rangeHeader != null) {
+            parseRange(rangeHeader, info.totalSize) ?: run {
+                Log.w(tag, "Rango inválido pedido para stream $streamId: Range=$rangeHeader (totalSize=${info.totalSize})")
+                val invalidRangeResponse = newFixedLengthResponse(Status.RANGE_NOT_SATISFIABLE, "text/plain", "Rango inválido")
+                invalidRangeResponse.addHeader("Content-Range", "bytes */${info.totalSize}")
+                return invalidRangeResponse
+            }
+        } else {
+            0L until info.totalSize
         }
+
+        val status = if (isRangeRequest) Status.PARTIAL_CONTENT else Status.OK
+        val length = range.last - range.first + 1
+
+        val response = if (method == Method.HEAD) {
+            // HEAD: solo cabeceras, sin pedir nada a MEGA.
+            newFixedLengthResponse(status, info.mimeType, ByteArrayInputStream(ByteArray(0)), length)
+        } else {
+            try {
+                serveRange(info, range.first, range.last, status)
+            } catch (e: Exception) {
+                Log.e(tag, "Error sirviendo stream $streamId: ${e.message}", e)
+                return newFixedLengthResponse(Status.INTERNAL_ERROR, "text/plain", "Error: ${e.message}")
+            }
+        }
+
+        // Si serveRange devolvió un error (503, etc.), va tal cual, sin cabeceras de rango.
+        if (response.status != status) return response
+        response.addHeader("Accept-Ranges", "bytes")
+        if (isRangeRequest) {
+            response.addHeader("Content-Range", "bytes ${range.first}-${range.last}/${info.totalSize}")
+        }
+        return response
     }
 
     /**
-     * Calcula el rango real solicitado. Si no hay header Range, se sirve
-     * desde 0 hasta el final (comportamiento de descarga completa, pero
-     * ExoPlayer casi siempre manda Range).
+     * Interpreta un único `Range: bytes=...` ya validado como tal.
      *
-     * @return el par (start, end) normalizado, o `null` si el rango pedido
-     *   es degenerado/inválido (ej. "bytes=175-174", start > end) -- pasarlo
-     *   tal cual a [serveRange] daba requestedLength <= 0 y un header
-     *   Content-Range con start > end, que el cliente HTTP del reproductor
-     *   no podía parsear ("could not parse long range"): el reproductor se
-     *   quedaba sin ese rango y el contenedor MKV terminaba incompleto
-     *   ("Unexpected end of file", "seconds missing from the timeline"),
-     *   aunque el resto del archivo sí hubiera llegado bien.
+     * Soporta `bytes=a-b`, `bytes=a-` y el rango de sufijo `bytes=-N` (los
+     * últimos N bytes). Este último lo piden algunos reproductores para leer
+     * el `moov` de MP4 que está al final del archivo; antes se interpretaba
+     * como "desde 0 hasta N", devolviendo bytes equivocados.
+     *
+     * @return el rango normalizado (inclusive), o `null` si es inválido o
+     *   está fuera del archivo (se responde 416).
      */
-    private fun parseRange(rangeHeader: String?, totalSize: Long): Pair<Long, Long>? {
-        if (rangeHeader.isNullOrBlank() || !rangeHeader.startsWith("bytes=")) {
-            return 0L to (totalSize - 1)
+    private fun parseRange(header: String, totalSize: Long): LongRange? {
+        val parts = header.removePrefix("bytes=").split("-")
+        if (parts.size != 2) return null
+
+        if (parts[0].isEmpty()) {
+            val suffix = parts[1].toLongOrNull()?.takeIf { it > 0 } ?: return null
+            return (totalSize - suffix).coerceAtLeast(0)..(totalSize - 1)
         }
-        val spec = rangeHeader.removePrefix("bytes=")
-        val parts = spec.split("-")
-        val start = parts.getOrNull(0)?.toLongOrNull() ?: 0L
-        val end = parts.getOrNull(1)?.takeIf { it.isNotBlank() }?.toLongOrNull() ?: (totalSize - 1)
-        val clampedEnd = end.coerceAtMost(totalSize - 1)
-        if (start < 0 || start > clampedEnd) return null
-        return start to clampedEnd
+
+        val start = parts[0].toLongOrNull()?.takeIf { it in 0 until totalSize } ?: return null
+        val end = if (parts[1].isEmpty()) totalSize - 1 else parts[1].toLongOrNull() ?: return null
+        if (end < start) return null
+        return start..end.coerceAtMost(totalSize - 1)
     }
 
     // Cliente con timeouts propios para pedir el rango a MEGA.
@@ -175,7 +196,7 @@ internal class MegaProxyServer(
      * basta pedir a MEGA los bytes cifrados alineados al bloque de 16 más
      * cercano por debajo de `start`, descifrar, y recortar el sobrante.
      */
-    private fun serveRange(info: StreamInfo, start: Long, end: Long): Response {
+    private fun serveRange(info: StreamInfo, start: Long, end: Long, status: Status): Response {
         val alignedStart = start - (start % 16)
         val blockOffset = alignedStart / 16
         val trimFront = (start - alignedStart).toInt()
@@ -229,131 +250,45 @@ internal class MegaProxyServer(
             )
         }
 
-        val cipherStream = upstreamResponse.body.byteStream()
-
-        // Pipe: descifrado en un hilo productor, NanoHTTPD consume del lado lector.
-        val pipedOut = PipedOutputStream()
-        val pipedIn = PipedInputStream(pipedOut, 256 * 1024)
-
-        ioExecutor.execute {
-            try {
-                decryptStreamInto(
-                    cipherStream = cipherStream,
-                    output = pipedOut,
-                    aesKey = info.aesKey,
-                    nonce = info.nonce,
-                    startBlockOffset = blockOffset,
-                    trimFront = trimFront,
-                    totalPlainBytesToEmit = requestedLength,
-                )
-            } catch (e: java.io.IOException) {
-                if (e.message == "Pipe closed") {
-                    // Normal cuando MPV corta la conexión a mitad de un
-                    // rango (buffer suficiente, o hizo seek). No es un fallo
-                    // real; el finally de abajo igual cierra todo.
-                    Log.d(tag, "Stream cortado por el lector antes de terminar (normal en seeks)")
-                } else {
-                    Log.e(tag, "Error de I/O descifrando stream: ${e.message}", e)
-                }
-            } catch (e: Exception) {
-                Log.e(tag, "Error descifrando stream: ${e.message}", e)
-            } finally {
-                runCatching { pipedOut.close() }
-                runCatching { upstreamResponse.close() }
-            }
+        // Validación temprana: MEGA debe devolver exactamente los bytes alineados
+        // que pedimos. Si el largo no coincide (p. ej. ignoró el Range y mandó el
+        // archivo entero), descifrar daría basura o dejaría el Content-Length que
+        // prometemos al reproductor a medias; mejor fallar acá con un error claro.
+        val expectedUpstreamLength = end - alignedStart + 1
+        val actualUpstreamLength = upstreamResponse.body.contentLength()
+        if (actualUpstreamLength >= 0 && actualUpstreamLength != expectedUpstreamLength) {
+            Log.e(
+                tag,
+                "MEGA devolvió $actualUpstreamLength bytes para bytes=$alignedStart-$end " +
+                    "(se esperaban $expectedUpstreamLength). Code=${upstreamResponse.code}",
+            )
+            upstreamResponse.close()
+            return newFixedLengthResponse(
+                Status.SERVICE_UNAVAILABLE,
+                "text/plain",
+                "MEGA devolvió un tamaño de rango inesperado",
+            )
         }
 
-        // Usamos newFixedLengthResponse con un InputStream (no un byte[]):
-        // como conocemos de antemano cuántos bytes en claro vamos a emitir
+        val cipherStream = upstreamResponse.body.byteStream()
+
+        // Descifrado a demanda: NanoHTTPD lee de este stream y cada lectura
+        // consume y descifra lo necesario del stream de MEGA, sin hilos ni pipes.
+        // Como conocemos de antemano cuántos bytes en claro vamos a emitir
         // (requestedLength), NanoHTTPD escribe un Content-Length real en vez
         // de Transfer-Encoding: chunked. Mezclar ambos headers violaría el
         // spec HTTP/1.1 y podía confundir el parseo de ExoPlayer/OkHttp.
-        val response = newFixedLengthResponse(Status.PARTIAL_CONTENT, info.mimeType, pipedIn, requestedLength)
-        response.addHeader("Accept-Ranges", "bytes")
-        response.addHeader("Content-Range", "bytes $start-$end/${info.totalSize}")
-        return response
-    }
-
-    /**
-     * Lee el stream cifrado en bloques de 16 bytes (tamaño de bloque AES),
-     * descifra cada bloque con el contador correcto, descarta el recorte
-     * inicial ([trimFront]) y escribe exactamente [totalPlainBytesToEmit]
-     * bytes en claro al output.
-     */
-    private fun decryptStreamInto(
-        cipherStream: java.io.InputStream,
-        output: java.io.OutputStream,
-        aesKey: ByteArray,
-        nonce: ByteArray,
-        startBlockOffset: Long,
-        trimFront: Int,
-        totalPlainBytesToEmit: Long,
-    ) {
-        val chunkBlocks = 4096 // 4096 * 16 bytes = 64 KiB por lote, buen balance CPU/IO
-        val chunkBytes = chunkBlocks * 16
-        val buffer = ByteArray(chunkBytes)
-
-        var blockOffset = startBlockOffset
-        var pendingTrim = trimFront
-        var emitted = 0L
-
-        while (emitted < totalPlainBytesToEmit) {
-            val read = readFully(cipherStream, buffer)
-            if (read <= 0) {
-                // cipherStream se quedó sin datos ANTES de completar los
-                // totalPlainBytesToEmit prometidos a NanoHTTPD (vía el
-                // Content-Length que ya se armó en serveRange). Antes esto
-                // hacía "break" en silencio: la función terminaba "bien" (sin
-                // excepción), el finally de arriba cerraba pipedOut como si
-                // nada, y NanoHTTPD -- que sigue esperando leer los bytes
-                // faltantes del Content-Length que ya prometimos -- se
-                // encontraba el pipe cerrado y tiraba un IOException "Pipe
-                // closed" sin ningún contexto de qué pasó realmente (visto
-                // en anikku_crash_logs.txt). El corte real más probable es
-                // que MEGA cerró la conexión a mitad de camino (cuota de
-                // transferencia agotada u otro corte de red); lanzar acá
-                // hace que ese catch de más arriba SÍ lo registre como
-                // error real en vez de perderse en silencio.
-                throw java.io.IOException(
-                    "MEGA cortó el stream a mitad de la transferencia: se llevaban " +
-                        "$emitted de $totalPlainBytesToEmit bytes en claro esperados. " +
-                        "Causa más probable: cuota de transferencia agotada o corte de red.",
-                )
-            }
-
-            // Los datos cifrados deben venir en múltiplos de 16 salvo el
-            // último bloque del archivo, que MEGA no rellena: si el tramo
-            // leído no es múltiplo de 16, se procesa igual (el cipher AES-CTR
-            // no requiere padding, opera XOR byte a byte con el keystream).
-            val plain = MegaCrypto.aesCtrDecrypt(aesKey, nonce, blockOffset, buffer.copyOf(read))
-
-            var from = 0
-            if (pendingTrim > 0) {
-                val skip = pendingTrim.coerceAtMost(plain.size)
-                from = skip
-                pendingTrim -= skip
-            }
-
-            if (from < plain.size) {
-                val remainingToEmit = (totalPlainBytesToEmit - emitted).coerceAtMost((plain.size - from).toLong()).toInt()
-                if (remainingToEmit > 0) {
-                    output.write(plain, from, remainingToEmit)
-                    emitted += remainingToEmit
-                }
-            }
-
-            blockOffset += (read / 16)
-            if (read % 16 != 0) blockOffset += 1
-        }
-    }
-
-    private fun readFully(input: java.io.InputStream, buffer: ByteArray): Int {
-        var total = 0
-        while (total < buffer.size) {
-            val n = input.read(buffer, total, buffer.size - total)
-            if (n < 0) break
-            total += n
-        }
-        return total
+        // NanoHTTPD cierra el stream al terminar o si el cliente se desconecta,
+        // y eso cierra también la respuesta de MEGA.
+        val body = MegaDecryptingInputStream(
+            source = cipherStream,
+            owner = upstreamResponse,
+            aesKey = info.aesKey,
+            nonce = info.nonce,
+            startBlockOffset = blockOffset,
+            trimFront = trimFront,
+            totalPlainBytes = requestedLength,
+        )
+        return newFixedLengthResponse(status, info.mimeType, body, requestedLength)
     }
 }

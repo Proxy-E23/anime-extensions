@@ -12,7 +12,7 @@ import kotlinx.serialization.Serializable
 @Serializable
 data class MegaLinkData(
     val url: String,
-    val type: String, // "single" | "multi" | "cloud" | "cloud_folder" | "error404"
+    val type: String, // "single" | "multi" | "cloud" | "cloud_folder" | "cloud_error" | "error404"
     val info: MegaLinkDataInfo? = null,
     // Solo con type="cloud_folder": handle de la carpeta de primer nivel del
     // Cloud Drive que representa esta entrada. Con type="cloud" (los videos

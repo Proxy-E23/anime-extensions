@@ -25,7 +25,7 @@ public link and stream its content, similar in spirit to what `megatools` or
 ## How It Works
 
 1. **Link parsing**: `MegaLinkParser` recognizes legacy (`#!` / `#F!`) and
-   current (`/file/`, `/folder/`) link formats, extracting the node handle
+   current (`/file/`, `/embed/`, `/folder/`) link formats, extracting the node handle
    and the base64 key from the URL.
 2. **API calls**: `MegaApi` talks to `https://g.api.mega.co.nz/cgi/mega`, MEGA's
    JSON-RPC endpoint, to list a folder tree (`a:f`) or request a temporary
@@ -36,7 +36,7 @@ public link and stream its content, similar in spirit to what `megatools` or
    - AES-CBC (zero IV) to decrypt file/folder names from the `a` attribute.
    - AES-CTR to decrypt the actual file content, block by block.
 4. **Streaming proxy**: `MegaProxyServer` (NanoHTTPD) exposes each resolved
-   video at `http://127.0.0.1:<port>/stream/<handle>`. When the player
+   video at `http://127.0.0.1:<port>/stream/<token-aleatorio>`. When the player
    requests a `Range`, the proxy:
    - Aligns the requested byte offset down to the nearest 16-byte AES block.
    - Requests that aligned range from MEGA's temporary download URL.

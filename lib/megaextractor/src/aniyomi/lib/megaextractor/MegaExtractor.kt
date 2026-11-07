@@ -1,6 +1,7 @@
 package aniyomi.lib.megaextractor
 
 import eu.kanade.tachiyomi.animesource.model.Video
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 
 /**
@@ -98,6 +99,8 @@ class MegaExtractor(private val client: OkHttpClient) {
     fun listCloudDrive(): List<MegaNode> = api.listCloudDrive().filter { it.isFolder || it.isVideo() }
 
     companion object {
+        private val ALLOWED_DOWNLOAD_HOST_SUFFIXES = listOf(".mega.co.nz", ".mega.nz", ".mega.io")
+
         private val VIDEO_EXTENSIONS = setOf(
             "mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v", "3gp", "ts", "mpg", "mpeg",
         )
@@ -155,7 +158,6 @@ class MegaExtractor(private val client: OkHttpClient) {
         val totalSize = download.s ?: node.size
 
         return buildVideoFromDownload(
-            streamId = node.handle,
             downloadUrl = downloadUrl,
             keyMaterial = keyMaterial,
             totalSize = totalSize,
@@ -176,7 +178,6 @@ class MegaExtractor(private val client: OkHttpClient) {
         val totalSize = download.s ?: node.size
 
         return buildVideoFromDownload(
-            streamId = node.handle,
             downloadUrl = downloadUrl,
             keyMaterial = keyMaterial,
             totalSize = totalSize,
@@ -190,7 +191,6 @@ class MegaExtractor(private val client: OkHttpClient) {
         val totalSize = download.s ?: meta.size
 
         return buildVideoFromDownload(
-            streamId = meta.handle,
             downloadUrl = downloadUrl,
             keyMaterial = meta.keyMaterial,
             totalSize = totalSize,
@@ -199,7 +199,6 @@ class MegaExtractor(private val client: OkHttpClient) {
     }
 
     private fun buildVideoFromDownload(
-        streamId: String,
         downloadUrl: String,
         keyMaterial: MegaFileKeyMaterial,
         totalSize: Long,
@@ -207,18 +206,31 @@ class MegaExtractor(private val client: OkHttpClient) {
     ): List<Video> {
         val server = obtainProxyServer()
 
-        server.registerStream(
-            streamId,
+        val token = server.registerStream(
             MegaProxyServer.StreamInfo(
-                downloadUrl = downloadUrl,
+                downloadUrl = secureDownloadUrl(downloadUrl),
                 aesKey = keyMaterial.aesKey,
                 nonce = keyMaterial.nonce,
                 totalSize = totalSize,
             ),
         )
 
-        val localUrl = server.urlFor(streamId)
+        val localUrl = server.urlFor(token)
         return listOf(Video(localUrl, displayName, localUrl))
+    }
+
+    /**
+     * Verifica que la URL de descarga que devolvió la API apunte a un host de
+     * MEGA y fuerza https, para que el proxy nunca pida bytes (ni envíe
+     * cabeceras) a un servidor ajeno si la respuesta llegara manipulada.
+     */
+    private fun secureDownloadUrl(raw: String): String {
+        val url = raw.toHttpUrlOrNull()
+            ?: throw MegaApiException(-1, "URL de descarga inválida")
+        if (ALLOWED_DOWNLOAD_HOST_SUFFIXES.none { url.host.endsWith(it) }) {
+            throw MegaApiException(-1, "Host de descarga no permitido: ${url.host}")
+        }
+        return url.newBuilder().scheme("https").build().toString()
     }
 
     /**
