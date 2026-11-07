@@ -2,7 +2,6 @@ package eu.kanade.tachiyomi.animeextension.all.meganz
 
 import android.content.Context
 import android.content.SharedPreferences
-import android.graphics.Color
 import android.text.SpannableString
 import android.text.Spanned
 import android.text.style.ForegroundColorSpan
@@ -891,9 +890,12 @@ class Mega :
     }
 
     companion object {
-        private val COLOR_SESSION_OK = Color.parseColor("#4CAF50")
-        private val COLOR_SESSION_WARNING = Color.parseColor("#FFC107")
-        private val COLOR_SESSION_ERROR = Color.parseColor("#F44336")
+        // Colores como números (ARGB) y no con Color.parseColor: este bloque se ejecuta al cargar la
+        // clase, y el Inspector de CI corre en una JVM donde las APIs de Android son stubs que lanzan
+        // "Stub!". Nada de Android debe ejecutarse al cargar la clase.
+        private val COLOR_SESSION_OK = 0xFF4CAF50.toInt()
+        private val COLOR_SESSION_WARNING = 0xFFFFC107.toInt()
+        private val COLOR_SESSION_ERROR = 0xFFF44336.toInt()
 
         private val VIDEO_EXTENSIONS = setOf("mp4", "mkv", "avi", "mov", "webm", "m4v", "flv", "wmv", "ts", "m2ts")
 
