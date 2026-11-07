@@ -1,7 +1,7 @@
 ext {
     extName = 'MEGA'
     extClass = '.Mega'
-    extVersionCode = 19
+    extVersionCode = 20
 }
 
 apply plugin: "kei.plugins.extension.legacy"
