@@ -1,7 +1,7 @@
 ext {
     extName = 'El Abismo de Darkrai'
     extClass = '.ElAbismoDeDarkrai'
-    extVersionCode = 4
+    extVersionCode = 5
 }
 
 apply plugin: "kei.plugins.extension.legacy"
