@@ -1,6 +1,7 @@
 package eu.kanade.tachiyomi.animeextension.all.mediafire
 
 import android.content.SharedPreferences
+import android.widget.Toast
 import androidx.preference.EditTextPreference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
@@ -61,7 +62,17 @@ class MediaFireSrc :
 
     // ── Expansión recursiva ───────────────────────────────────────────────────
 
+    /** Anime ya expandido (o restaurado de la caché) con el estado y la descripción de su entrada guardada. */
+    private fun entryAnime(title: String, url: String, entry: MediaFirePreferences.Entry): SAnime = SAnime.create().apply {
+        this.title = title
+        this.url = url
+        status = entry.status
+        initialized = true
+        description = removeEntryHint(entry.name, entry.url)
+    }
+
     private fun expandFolder(
+        entry: MediaFirePreferences.Entry,
         key: String,
         folderName: String,
         parentTitle: String,
@@ -81,12 +92,7 @@ class MediaFireSrc :
                 } else {
                     "$parentTitle - $folderName"
                 }
-                results += SAnime.create().apply {
-                    url = "folder::$key::$folderName"
-                    title = displayTitle
-                    status = SAnime.UNKNOWN
-                    initialized = true
-                }
+                results += entryAnime(displayTitle, "folder::$key::$folderName", entry)
             }
         } else {
             videoFiles.forEach { file ->
@@ -95,17 +101,13 @@ class MediaFireSrc :
                 } else {
                     "$parentTitle - ${file.filename.substringBeforeLast('.')}"
                 }
-                results += SAnime.create().apply {
-                    url = "file::${file.quickkey}::${file.filename}"
-                    title = displayTitle
-                    status = SAnime.UNKNOWN
-                    initialized = true
-                }
+                results += entryAnime(displayTitle, "file::${file.quickkey}::${file.filename}", entry)
             }
 
             subFolders.forEach { sub ->
                 val subTitle = if (parentTitle.isBlank()) folderName else parentTitle
                 results += expandFolder(
+                    entry = entry,
                     key = sub.key,
                     folderName = sub.name,
                     parentTitle = subTitle,
@@ -126,44 +128,71 @@ class MediaFireSrc :
     private fun removeEntryHint(entryName: String, entryUrl: String): String = "Para eliminar este enlace, copia el nombre (\"$entryName\") o la URL de abajo " +
         "y pégala en Ajustes → Eliminar enlace:\n\n$entryUrl"
 
-    private fun buildSingleFileAnime(entryName: String, entryUrl: String): SAnime = SAnime.create().apply {
-        title = entryName
-        url = "file::$entryUrl"
-        status = SAnime.UNKNOWN
-        initialized = true
-        description = removeEntryHint(entryName, entryUrl)
-    }
+    private fun buildSingleFileAnime(entry: MediaFirePreferences.Entry): SAnime = entryAnime(entry.name, "file::${entry.url}", entry)
 
     /** Detecta si la carpeta fue eliminada; si no, la expande en episodios. */
-    private fun buildFolderAnime(entryName: String, entryUrl: String, key: String): List<SAnime> {
+    private fun buildFolderAnime(entry: MediaFirePreferences.Entry, key: String): List<SAnime> {
         if (extractor.isFolderMissing(key)) {
             return listOf(
                 SAnime.create().apply {
-                    title = "❌ $entryName (Carpeta eliminada o inválida)"
+                    title = "❌ ${entry.name} (Carpeta eliminada o inválida)"
                     thumbnail_url = "https://http.cat/404"
-                    url = "missing::$entryUrl"
+                    url = "missing::${entry.url}"
                     status = SAnime.UNKNOWN
-                    description = "Esta carpeta fue eliminada o el link ya no es válido.\n\n" + removeEntryHint(entryName, entryUrl)
+                    description = "Esta carpeta fue eliminada o el link ya no es válido.\n\n" + removeEntryHint(entry.name, entry.url)
                 },
             )
         }
 
-        val expanded = expandFolder(key = key, folderName = entryName, parentTitle = "")
-        return expanded.map { anime ->
-            anime.apply { description = removeEntryHint(entryName, entryUrl) }
+        return expandFolder(entry = entry, key = key, folderName = entry.name, parentTitle = "")
+    }
+
+    /**
+     * Enlaces guardados. Las carpetas marcadas como completadas se guardan en disco y no
+     * se vuelven a pedir (ni se comprueba si siguen existiendo); las demás (en emisión o
+     * desconocido) se leen una vez por sesión. Los archivos únicos no piden nada al
+     * construirse, así que no necesitan caché.
+     */
+    private fun buildEntryAnimes(entries: List<MediaFirePreferences.Entry>): List<SAnime> {
+        val diskCache = MediaFirePreferences.readCompletedCache(preferences)
+        val newDiskCache = mutableMapOf<String, List<MediaFirePreferences.CachedAnime>>()
+        val results = mutableListOf<SAnime>()
+
+        entries.forEach { entry ->
+            when (val link = extractor.parseLink(entry.url)) {
+                is MediaFireLink.File -> results += buildSingleFileAnime(entry)
+                is MediaFireLink.Folder -> {
+                    val completed = entry.status == SAnime.COMPLETED
+                    // El nombre forma parte de la clave porque define los títulos ("Nombre - Subcarpeta").
+                    val cacheKey = "${link.key}::${entry.name}"
+
+                    val cached = if (completed) diskCache[cacheKey] else null
+                    if (cached != null) {
+                        newDiskCache[cacheKey] = cached
+                        cached.forEach { results += entryAnime(it.title, it.url, entry) }
+                    } else {
+                        val animes = buildFolderAnime(entry, link.key)
+                        results += animes
+                        // Una carpeta caída ("missing::") o vacía nunca se guarda en disco.
+                        val isMissing = animes.any { it.url.startsWith("missing::") }
+                        if (completed && !isMissing && animes.isNotEmpty()) {
+                            newDiskCache[cacheKey] = animes.map { MediaFirePreferences.CachedAnime(it.title, it.url) }
+                        }
+                    }
+                }
+                null -> Unit
+            }
         }
+
+        // Poda: solo quedan en disco las carpetas que siguen guardadas y completadas.
+        if (newDiskCache != diskCache) MediaFirePreferences.writeCompletedCache(preferences, newDiskCache)
+        return results
     }
 
     override suspend fun getPopularAnime(page: Int): AnimesPage {
         cachedAnimes?.let { return AnimesPage(it, false) }
 
-        val animes = MediaFirePreferences.getEntries(preferences).flatMap { entry ->
-            when (val link = extractor.parseLink(entry.url)) {
-                is MediaFireLink.File -> listOf(buildSingleFileAnime(entry.name, entry.url))
-                is MediaFireLink.Folder -> buildFolderAnime(entry.name, entry.url, link.key)
-                null -> emptyList()
-            }
-        }
+        val animes = buildEntryAnimes(MediaFirePreferences.getEntries(preferences))
 
         cachedAnimes = animes
         return AnimesPage(animes, false)
@@ -182,6 +211,7 @@ class MediaFireSrc :
     ): AnimesPage {
         val urlFilter = filters.filterIsInstance<UrlFilter>().firstOrNull()
         val nameFilter = filters.filterIsInstance<NameFilter>().firstOrNull()
+        val statusFilter = filters.filterIsInstance<StatusFilter>().firstOrNull()
         val rawUrl = urlFilter?.state?.trim() ?: ""
 
         if (rawUrl.isNotBlank()) {
@@ -200,12 +230,13 @@ class MediaFireSrc :
                     is MediaFireLink.Folder -> extractor.fetchFolderName(link.key)
                 }
 
-            MediaFirePreferences.addEntry(preferences, resolvedName, rawUrl)
+            val entry = MediaFirePreferences.Entry(resolvedName, rawUrl, statusFilter?.state ?: SAnime.UNKNOWN)
+            MediaFirePreferences.addEntry(preferences, entry.name, entry.url, entry.status)
             cachedAnimes = null
 
             val result = when (link) {
-                is MediaFireLink.File -> listOf(buildSingleFileAnime(resolvedName, rawUrl))
-                is MediaFireLink.Folder -> buildFolderAnime(resolvedName, rawUrl, link.key)
+                is MediaFireLink.File -> listOf(buildSingleFileAnime(entry))
+                is MediaFireLink.Folder -> buildFolderAnime(entry, link.key)
             }
             return AnimesPage(result, false)
         }
@@ -224,6 +255,7 @@ class MediaFireSrc :
         SeparatorFilter(),
         UrlFilter(),
         NameFilter(),
+        StatusFilter(),
         SeparatorFilter(),
         InfoFilter("Deja los campos vacios para buscar por nombre"),
     )
@@ -285,8 +317,15 @@ class MediaFireSrc :
             description = "Esta carpeta fue eliminada o el link ya no es válido.\n\n" +
                 removeEntryHint(realName, ref.entryUrl)
         }
-        is AnimeUrlRef.RootFile -> anime.apply { description = removeEntryHint(anime.title, ref.entryUrl) }
-        is AnimeUrlRef.RootFolder -> anime.apply { description = removeEntryHint(anime.title, ref.entryUrl) }
+        is AnimeUrlRef.RootFile -> anime.apply {
+            description = removeEntryHint(anime.title, ref.entryUrl)
+            // El estado se lee siempre de las entradas guardadas para reflejar cambios hechos en Ajustes.
+            MediaFirePreferences.findByUrl(preferences, ref.entryUrl)?.let { status = it.status }
+        }
+        is AnimeUrlRef.RootFolder -> anime.apply {
+            description = removeEntryHint(anime.title, ref.entryUrl)
+            MediaFirePreferences.findByUrl(preferences, ref.entryUrl)?.let { status = it.status }
+        }
         else -> anime
     }
 
@@ -367,6 +406,31 @@ class MediaFireSrc :
 
     // ── Preferencias ──────────────────────────────────────────────────────────
 
+    /**
+     * Botón de acción en Ajustes. Este proyecto no ofrece la clase Preference simple,
+     * así que se usa un interruptor que ejecuta la acción al pulsarlo y rechaza el
+     * cambio (devuelve false) para quedarse siempre apagado. No pide confirmación:
+     * se usa solo para acciones inofensivas (recargar cachés).
+     */
+    private fun actionPreference(
+        screen: PreferenceScreen,
+        prefKey: String,
+        prefTitle: String,
+        prefSummary: String,
+        toastText: String,
+        action: () -> Unit,
+    ): SwitchPreferenceCompat = SwitchPreferenceCompat(screen.context).apply {
+        key = prefKey
+        title = prefTitle
+        summary = prefSummary
+        setDefaultValue(false)
+        setOnPreferenceChangeListener { _, _ ->
+            action()
+            Toast.makeText(screen.context, toastText, Toast.LENGTH_SHORT).show()
+            false
+        }
+    }
+
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         SwitchPreferenceCompat(screen.context).apply {
             key = MediaFirePreferences.PREF_SHOW_FILENAME
@@ -382,6 +446,11 @@ class MediaFireSrc :
             dialogTitle = "Enlaces guardados"
             setDialogMessage(
                 "Una entrada por línea.\n\nEjemplo:\nNombre::URL de MediaFire\n\n" +
+                    "Para indicar el estado de emisión, agrega al final ::e (en emisión), " +
+                    "::c (completado) o ::d (desconocido).\n" +
+                    "Ejemplo: Mi anime::https://www.mediafire.com/folder/abc123::c\n\n" +
+                    "Las carpetas marcadas como completadas se leen una sola vez y se guardan; si una cambia " +
+                    "o se elimina, usa \"Refrescar enlaces guardados\".\n\n" +
                     "Para eliminar una entrada, borra la línea completa.\n\n" +
                     "Para ver los cambios reflejados en el catálogo, cierra y vuelve a abrir la extensión.",
             )
@@ -422,6 +491,20 @@ class MediaFireSrc :
             }
         }
         screen.addPreference(removeEntryPref)
+
+        screen.addPreference(
+            actionPreference(
+                screen = screen,
+                prefKey = "mediafire_refresh_saved_links",
+                prefTitle = "Refrescar enlaces guardados",
+                prefSummary = "Las carpetas en emisión o desconocidas se leen al abrir Anikku; las completadas " +
+                    "se guardan. Esto fuerza una nueva lectura de todas, completadas incluidas.",
+                toastText = "Los enlaces se actualizarán al abrir el catálogo",
+            ) {
+                MediaFirePreferences.clearCompletedCache(preferences)
+                cachedAnimes = null
+            },
+        )
     }
 
     override fun latestUpdatesRequest(page: Int): Request = throw UnsupportedOperationException()
