@@ -83,6 +83,47 @@ class GoogleDriveScraper(private val client: OkHttpClient, private val headers: 
     fun listFolderItems(folderId: String, pageToken: String?): FolderPage? = (listFolderItemsResult(folderId, pageToken) as? FolderResult.Success)?.page
 
     /**
+     * Verdadero si hay una sesión de Google activa (cookie de sesión presente en el
+     * cliente). No comprueba que siga vigente: si venció, [listMyDriveRoot] falla
+     * con un mensaje que lo indica.
+     */
+    fun isLoggedIn(): Boolean = client.sapisidFor("https://drive.google.com").isNotBlank()
+
+    /**
+     * Lista una página de la raíz de "Mi unidad" de la cuenta con sesión iniciada
+     * (un solo nivel, con los shortcuts ya resueltos). No incluye "Compartido
+     * conmigo" ni unidades compartidas.
+     *
+     * A diferencia de [listFolderItemsResult], lanza una excepción con un mensaje
+     * legible si algo falla, para que el consumidor lo muestre al usuario.
+     */
+    fun listMyDriveRoot(pageToken: String?): FolderPage {
+        val document = fetchMyDriveDocument()
+            ?: throw IllegalStateException("No se pudo abrir Mi unidad de Google Drive.")
+        val key = extractKey(document)
+            ?: throw IllegalStateException("No se encontró la clave de acceso de Drive; la sesión de Google podría haber vencido.")
+
+        val parsed = try {
+            client.newCall(
+                createBatchPost(document, defaultGetRequest("root", pageToken ?: "", key), keyOverride = key),
+            ).execute().parseAs<PostResponse> { JSON_REGEX.find(it)!!.groupValues[1] }
+        } catch (e: Exception) {
+            throw IllegalStateException("Drive no devolvió el contenido de Mi unidad; la sesión de Google podría haber vencido.", e)
+        }
+
+        // En la raíz de Mi unidad casi todo pertenece a la cuenta: el dueño más frecuente es su correo.
+        val accountEmail = parsed.items.orEmpty()
+            .flatMap { it.owners.orEmpty() }
+            .mapNotNull { it.emailAddressFromAccount?.takeIf { email -> email.isNotBlank() } }
+            .groupingBy { it }
+            .eachCount()
+            .maxByOrNull { it.value }
+            ?.key
+
+        return FolderPage(parsed.items?.map { it.toScrapedItem() } ?: emptyList(), parsed.nextPageToken, accountEmail)
+    }
+
+    /**
      * Nombre real de un archivo suelto de Drive, leído del `<title>` de su
      * página pública -- sin autenticación, sin batch API. Más liviano que
      * [fetchFileMetadata] cuando solo hace falta el nombre.

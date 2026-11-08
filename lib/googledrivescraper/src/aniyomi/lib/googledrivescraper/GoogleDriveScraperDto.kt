@@ -19,6 +19,12 @@ internal data class PostResponse(
         val fileSize: String? = null,
         val modifiedDate: String? = null,
         val shortcutDetails: ShortcutDetails? = null,
+        val owners: List<Owner>? = null,
+    )
+
+    @Serializable
+    data class Owner(
+        val emailAddressFromAccount: String? = null,
     )
 
     @Serializable
@@ -76,6 +82,8 @@ data class ScrapedItem(
 data class FolderPage(
     val items: List<ScrapedItem>,
     val nextPageToken: String?,
+    // Correo de la cuenta, solo en [GoogleDriveScraper.listMyDriveRoot] (dueño más frecuente de los elementos).
+    val accountEmail: String? = null,
 )
 
 /**
