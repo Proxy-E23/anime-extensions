@@ -398,8 +398,7 @@ class AniGram :
 
     override fun popularAnimeRequest(page: Int): Request = throw UnsupportedOperationException("popularAnimeRequest")
     override fun popularAnimeParse(response: Response): AnimesPage = throw UnsupportedOperationException("popularAnimeParse")
-    override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request =
-        throw UnsupportedOperationException("searchAnimeRequest")
+    override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request = throw UnsupportedOperationException("searchAnimeRequest")
     override fun searchAnimeParse(response: Response): AnimesPage = throw UnsupportedOperationException("searchAnimeParse")
     override fun latestUpdatesRequest(page: Int): Request = throw UnsupportedOperationException("latestUpdatesRequest")
     override fun latestUpdatesParse(response: Response): AnimesPage = throw UnsupportedOperationException("latestUpdatesParse")
