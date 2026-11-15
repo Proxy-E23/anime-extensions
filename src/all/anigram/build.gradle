@@ -1,0 +1,33 @@
+ext {
+    extName = 'AniGram'
+    extClass = '.AniGram'
+    extVersionCode = 1
+}
+
+apply plugin: "kei.plugins.extension.legacy"
+
+android {
+    buildTypes {
+        release {
+            // TDLib llama a sus clases por nombre desde codigo nativo: no se minimiza esta extension
+            minifyEnabled false
+        }
+    }
+    defaultConfig {
+        ndk {
+            abiFilters "arm64-v8a"
+        }
+    }
+    packaging {
+        jniLibs {
+            // Obliga a extraer libtdjni.so al disco: se carga a mano con System.load
+            useLegacyPackaging = true
+        }
+    }
+}
+
+dependencies {
+    implementation(project(':lib:filenameutils'))
+    implementation("com.github.tdlibx:td:1.8.56")
+    implementation("com.github.komikku-app.nanohttpd:nanohttpd:gradle-upgrade-SNAPSHOT")
+}
