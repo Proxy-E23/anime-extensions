@@ -371,7 +371,11 @@ class AniGram :
         val leidos = Catalogo.leerEpisodios(enlace, mensajeId, esperados)
         if (leidos.videos.isEmpty()) return emptyList()
 
-        val ordenados = FilenameUtils.sortBySeasonAndEpisodeDescending(leidos.videos, { it.nombre }, showFilename)
+        val ordenados = FilenameUtils.sortBySeasonAndEpisodeDescending(
+            leidos.videos,
+            { Catalogo.nombreParaLibreria(it.nombre) },
+            showFilename,
+        )
         return ordenados.map { ep ->
             SEpisode.create().apply {
                 name = ep.display.name

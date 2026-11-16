@@ -144,6 +144,17 @@ object Catalogo {
         }
     }
 
+    // Codigo CRC32 de 8 caracteres hexadecimales que quedo sin corchetes (ej. "... AAC A383B404.mp4")
+    private val regexHashSuelto = Regex(
+        """(?<![\[0-9A-Za-z])(?=[0-9A-Fa-f]*[A-Fa-f])(?=[0-9A-Fa-f]*\d)[0-9A-Fa-f]{8}(?![\]0-9A-Za-z])""",
+    )
+
+    /**
+     * Devuelve los corchetes a un hash que llegue sin ellos. Sin esto, FilenameUtils lee los digitos del hash
+     * ("A383B404" -> 404) como si fueran el numero de episodio.
+     */
+    fun nombreParaLibreria(nombre: String): String = regexHashSuelto.replace(nombre) { "[${it.value}]" }
+
     fun normalizar(s: String): String = Normalizer.normalize(s, Normalizer.Form.NFD).replace(Regex("\\p{M}+"), "").lowercase().trim()
 
     private fun temaDe(info: TdApi.MessageLinkInfo): TdApi.MessageTopic? = try {
@@ -457,6 +468,10 @@ object Catalogo {
             ""
         }
         ultimoAviso = if (aviso.isEmpty()) "Ultimo anime leido: ${videos.size} episodios" else "Ultimo anime leido: $aviso"
+        if (videos.isNotEmpty()) {
+            val primeros = videos.take(3).joinToString(" | ") { it.nombre }
+            TdSession.evento("EPISODIOS ${videos.size}, primeros nombres: $primeros")
+        }
         return EpisodiosLeidos(videos, aviso)
     }
 }
