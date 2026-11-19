@@ -19,14 +19,12 @@ import keiyoushi.utils.ParsedAnimeHttpLegacySource
 import keiyoushi.utils.addListPreference
 import keiyoushi.utils.addSwitchPreference
 import keiyoushi.utils.getPreferencesLazy
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
-import okhttp3.FormBody
 import okhttp3.Request
 import okhttp3.Response
-import org.json.JSONObject
-import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import uy.kohesive.injekt.Injekt
@@ -41,9 +39,16 @@ class GakuensaiFansub :
     override val lang = "es"
     override val supportsLatest = true
 
-    private val ajaxUrl = "$baseUrl/wp-admin/admin-ajax.php"
-    private val projectsUrl = "$baseUrl/proyectos"
-    private val nsfwUrl = "$baseUrl/fap"
+    // El sitio ahora es un foro SMF: todo cuelga de index.php. La misma página de proyectos
+    // trae las pestañas SFW ("Proyectos") y NSFW ("FAP") dentro del mismo HTML.
+    private val homeUrl = "$baseUrl/index.php"
+    private val projectsUrl = "$baseUrl/index.php?action=projects"
+
+    // Los enlaces de descarga (sa=enlaces) son redirecciones del propio sitio hacia el host
+    // real, así que se piden sin seguir la redirección para leer el destino.
+    private val noRedirectClient by lazy {
+        client.newBuilder().followRedirects(false).followSslRedirects(false).build()
+    }
 
     private val extractor by lazy {
         MediaFireExtractor(client, headers, "https://www.mediafire.com")
@@ -94,13 +99,15 @@ class GakuensaiFansub :
         thumbnailPrefs.edit().putString(url, thumbnailUrl).apply()
     }
 
-    // Resuelve en paralelo la portada vertical de las series que aún no estén en caché.
+    // Resuelve en paralelo la portada vertical de las series que aún no estén en caché y
+    // aplica la portada cacheada a TODAS las entradas de la lista. Las entradas vienen del
+    // catálogo, que se armó con el banner del listado antes de que existiera la portada en
+    // caché, así que hay que reemplazarlo también en las que ya estaban cacheadas.
     private suspend fun resolveMissingThumbnails(list: List<SAnime>): List<SAnime> = coroutineScope {
         val pending = list.filter { it.url.isNotBlank() && getCachedThumbnail(it.url) == null }
-        if (pending.isEmpty()) return@coroutineScope list
 
         val resolved = pending.map { anime ->
-            async {
+            async(Dispatchers.IO) {
                 anime.url to try {
                     val document = client.newCall(GET("$baseUrl${anime.url}", headers)).execute().asJsoup()
                     animeDetailsParse(document).thumbnail_url
@@ -110,14 +117,13 @@ class GakuensaiFansub :
             }
         }.awaitAll().toMap()
 
+        resolved.forEach { (url, thumbnail) ->
+            if (!thumbnail.isNullOrBlank()) cacheThumbnail(url, thumbnail)
+        }
+
         list.map { anime ->
-            val newThumbnail = resolved[anime.url]
-            if (!newThumbnail.isNullOrBlank()) {
-                cacheThumbnail(anime.url, newThumbnail)
-                anime.apply { thumbnail_url = newThumbnail }
-            } else {
-                anime
-            }
+            val thumbnail = getCachedThumbnail(anime.url)
+            if (thumbnail != null) anime.apply { thumbnail_url = thumbnail } else anime
         }
     }
 
@@ -154,15 +160,11 @@ class GakuensaiFansub :
 
     override fun popularAnimeRequest(page: Int): Request = GET(projectsUrl, headers)
 
-    // Catálogo crudo completo (SFW + NSFW, sin filtrar todavía).
+    // Catálogo crudo completo (SFW + NSFW, sin filtrar todavía). Una sola petición: ambas
+    // pestañas vienen en el mismo HTML. Si falla se propaga el error (no se cachea vacío).
     private suspend fun getFullCatalog(): List<SAnime> = popularCache ?: run {
-        val sfw = runCatching {
-            parseProjectsListing(client.newCall(popularAnimeRequest(1)).execute().asJsoup(), isNsfwListing = false)
-        }.getOrElse { emptyList() }
-        val nsfw = runCatching {
-            parseProjectsListing(client.newCall(GET(nsfwUrl, headers)).execute().asJsoup(), isNsfwListing = true)
-        }.getOrElse { emptyList() }
-        (sfw + nsfw).also { popularCache = it }
+        val document = client.newCall(popularAnimeRequest(1)).execute().asJsoup()
+        parseProjectsListing(document).also { if (it.isNotEmpty()) popularCache = it }
     }
 
     override suspend fun getPopularAnime(page: Int): AnimesPage {
@@ -185,26 +187,35 @@ class GakuensaiFansub :
 
     // Se marca el título con prefijos invisibles para saber, sin volver a pedir la página,
     // la sección y si la entrada es NSFW. Se retiran en withCleanTitle().
-    private fun parseProjectsListing(document: Document, isNsfwListing: Boolean): List<SAnime> {
-        val sections = document.select("div.entry > div")
-        val ordered = mutableListOf<SAnime>()
-
-        listOf(SECTION_ONGOING, SECTION_COMPLETED, SECTION_OTHER).forEach { sectionName ->
-            val header = sections.firstOrNull { it.selectFirst("h2")?.text()?.trim()?.startsWith(sectionName) == true }
-            val container = header?.nextElementSibling() ?: return@forEach
-            container.select(seriesCardSelector()).forEach { element ->
-                ordered += seriesCardToSAnime(element, isNsfwSection = isNsfwListing, section = sectionName)
+    private fun parseProjectsListing(document: Document): List<SAnime> {
+        val result = mutableListOf<SAnime>()
+        document.select("div.fichas-tab-panel").forEach { panel ->
+            val isNsfwPanel = panel.attr("data-tab-panel") == "nsfw"
+            panel.select("h3.fichas-section").forEach { header ->
+                val sectionName = normalizeSection(header.text())
+                val container = header.nextElementSibling() ?: return@forEach
+                container.select(seriesCardSelector()).forEach { card ->
+                    result += seriesCardToSAnime(card, isNsfwSection = isNsfwPanel, section = sectionName)
+                }
             }
         }
-        return ordered
+        return result
     }
 
-    private fun seriesCardSelector(): String = "div.la-serie"
+    private fun normalizeSection(raw: String): String {
+        val text = raw.trim()
+        return listOf(SECTION_ONGOING, SECTION_COMPLETED, SECTION_OTHER)
+            .firstOrNull { text.startsWith(it, ignoreCase = true) } ?: text
+    }
+
+    private fun seriesCardSelector(): String = "div.ficha-card"
 
     private fun seriesCardToSAnime(element: Element, isNsfwSection: Boolean, section: String): SAnime = SAnime.create().apply {
         val link = element.selectFirst("a[href]")
         url = link?.attr("href")?.removePrefix(baseUrl).orEmpty()
-        val cleanTitle = link?.selectFirst("img")?.attr("alt")?.trim()?.ifBlank { null } ?: element.attr("title").trim()
+        val cleanTitle = element.attr("title").trim().ifBlank { null }
+            ?: link?.selectFirst("img")?.attr("alt")?.trim()?.ifBlank { null }
+            ?: link?.selectFirst("div.ficha-text p")?.text()?.trim().orEmpty()
         title = (if (isNsfwSection) NSFW_MARK else "") + sectionMark(section) + cleanTitle
         thumbnail_url = getCachedThumbnail(url) ?: link?.selectFirst("img")?.attr("src")
         genre = if (isNsfwSection) "NSFW" else null
@@ -220,25 +231,26 @@ class GakuensaiFansub :
     override fun popularAnimeNextPageSelector(): String? = null
 
     // Requerido por la clase base; getPopularAnime maneja la paginación real.
-    override fun popularAnimeParse(response: Response): AnimesPage = AnimesPage(parseProjectsListing(response.asJsoup(), isNsfwListing = false), false)
+    override fun popularAnimeParse(response: Response): AnimesPage = AnimesPage(parseProjectsListing(response.asJsoup()), false)
 
     // =============================== Latest / Recientes ===============================
-    // La home publica un post por cada capítulo. Se consolida a una sola entrada por serie,
-    // quedándose con la fecha del post más reciente.
+    // La portada lista un artículo por cada publicación (capítulo, volumen, etc.), 8 por
+    // página (?articles=0, 8, 16...). Cada uno trae la "categoría" (board) y el título del
+    // post; con eso se busca el proyecto en el catálogo y se consolida a una entrada por
+    // serie, conservando el orden (más reciente primero). Se leen solo las primeras páginas.
     private var latestCache: List<SAnime>? = null
     private val latestPageCache = mutableMapOf<Int, AnimesPage>()
 
-    override fun latestUpdatesRequest(page: Int): Request = GET(baseUrl, headers)
+    private data class HomePost(val boardName: String, val postTitle: String)
+
+    private fun homePageUrl(page: Int): String = if (page <= 1) homeUrl else "$homeUrl?articles=${(page - 1) * HOME_ARTICLES_PER_PAGE}"
+
+    override fun latestUpdatesRequest(page: Int): Request = GET(homePageUrl(page), headers)
 
     override suspend fun getLatestUpdates(page: Int): AnimesPage {
         latestPageCache[page]?.let { return it }
 
-        val all = latestCache ?: run {
-            val document = client.newCall(latestUpdatesRequest(1)).execute().asJsoup()
-            val list = parseHomeConsolidated(document)
-            latestCache = list
-            list
-        }
+        val all = latestCache ?: buildLatestList().also { if (it.isNotEmpty()) latestCache = it }
 
         val filtered = all.filter { passesNsfwFilter(it.title.startsWith(NSFW_MARK)) }
             .map { it.withCleanTitle() }
@@ -251,66 +263,49 @@ class GakuensaiFansub :
         return AnimesPage(pageItems, hasNext).also { latestPageCache[page] = it }
     }
 
-    // Cada post trae: link al post, categorías (la última es la más específica), timestamp
-    // UNIX en el atributo utime, y un ribbon NSFW opcional.
-    private data class HomePost(val projectUrl: String, val title: String, val timestamp: Long, val isNsfw: Boolean)
-
-    private suspend fun parseHomeConsolidated(document: Document): List<SAnime> {
-        val posts = document.select("div.card-index").mapNotNull { card ->
-            val categoryLinks = card.select("div.post-categories a[href*=/category/]")
-            val mostSpecificHref = categoryLinks.lastOrNull()?.attr("href") ?: return@mapNotNull null
-            val slug = mostSpecificHref.trimEnd('/').substringAfterLast('/')
-            val title = card.selectFirst("h5 a")?.text()?.trim() ?: return@mapNotNull null
-            val timestamp = card.selectFirst("time[utime]")?.attr("utime")?.toLongOrNull() ?: 0L
-            val isNsfw = card.selectFirst("div.ribbon-wrapper, div.ribbon") != null
-
-            val basePath = if (isNsfw) "/fap" else "/proyectos"
-            HomePost(projectUrl = "$basePath/$slug/", title = title, timestamp = timestamp, isNsfw = isNsfw)
-        }
-
+    private suspend fun buildLatestList(): List<SAnime> = coroutineScope {
+        val catalog = getFullCatalog()
         val index = getProjectIndex()
-        val knownProjectUrls = index.values.toSet()
-        val nsfwProjectUrls = getNsfwProjectUrls()
+        val catalogByUrl = catalog.associateBy { it.url }
 
-        // Si la URL construida a partir del slug de categoría coincide con una URL real
-        // conocida se usa tal cual; si no, plan B por título normalizado (el slug de
-        // categoría no siempre coincide con el slug real del proyecto).
-        val grouped = posts.groupBy { post ->
-            if (post.projectUrl in knownProjectUrls) {
-                post.projectUrl
-            } else {
-                val normalized = normalizeTitle(post.title)
-                index.entries.firstOrNull { (key, _) -> normalized.contains(key) || key.contains(normalized) }?.value
-                    ?: post.projectUrl
+        val posts = (1..LATEST_HOME_PAGES).map { homePage ->
+            async(Dispatchers.IO) {
+                runCatching { parseHomePosts(client.newCall(GET(homePageUrl(homePage), headers)).execute().asJsoup()) }
+                    .getOrElse { emptyList() }
             }
-        }
+        }.awaitAll().flatten()
 
-        return grouped.map { (projectUrl, groupPosts) ->
-            val latest = groupPosts.maxByOrNull { it.timestamp } ?: groupPosts.first()
-            // El índice NSFW real (de qué listado vino la URL) manda sobre el ribbon del
-            // post, que puede faltar en algún post aislado.
-            val isNsfw = if (projectUrl in nsfwProjectUrls) {
-                true
-            } else if (projectUrl in knownProjectUrls) {
-                false
-            } else {
-                latest.isNsfw
-            }
-            SAnime.create().apply {
-                url = projectUrl
-                title = (if (isNsfw) NSFW_MARK else "") + seriesTitleFromPostTitle(latest.title)
-                thumbnail_url = getCachedThumbnail(projectUrl)
-            }
-        }.sortedByDescending { anime ->
-            grouped.entries.first { it.key == anime.url }.value.maxOf { it.timestamp }
-        }
+        posts.mapNotNull { matchProjectUrl(it, index) }
+            .distinct()
+            .mapNotNull { catalogByUrl[it] }
     }
 
-    // El título del post suele ser "Serie – NN" o "Serie – NN y MM"; se recorta el sufijo de
-    // episodio para mostrar el nombre limpio de la serie.
-    private fun seriesTitleFromPostTitle(postTitle: String): String = postTitle.substringBefore(" – ").substringBefore(" [").trim().ifBlank { postTitle }
+    private fun parseHomePosts(document: Document): List<HomePost> = document.select("div.sp_article_modern_card").mapNotNull { card ->
+        val postTitle = card.selectFirst("h3.sp_article_modern_title a")?.text()?.trim() ?: return@mapNotNull null
+        val boardName = card.selectFirst("div.sp_article_modern_board a")?.text()?.trim().orEmpty()
+        HomePost(boardName, postTitle)
+    }
 
-    override fun latestUpdatesSelector(): String = "div.card-index h5 a"
+    // 1) El título del post empieza con el nombre del proyecto (gana el más largo, así
+    //    "... Naru II - 12" no cae en "... Naru"). 2) Plan B: la categoría del post coincide
+    //    con el proyecto o está contenida en su nombre ("Koe no Katachi" -> "Eiga Koe no Katachi").
+    private fun matchProjectUrl(post: HomePost, index: Map<String, String>): String? {
+        val postKey = normalizeTitle(post.postTitle)
+        index.entries
+            .filter { (key, _) -> key.isNotEmpty() && postKey.startsWith(key) }
+            .maxByOrNull { it.key.length }
+            ?.let { return it.value }
+
+        val boardKey = normalizeTitle(post.boardName)
+        if (boardKey.isEmpty()) return null
+        index[boardKey]?.let { return it }
+        return index.entries
+            .filter { (key, _) -> key.contains(boardKey) }
+            .minByOrNull { it.key.length }
+            ?.value
+    }
+
+    override fun latestUpdatesSelector(): String = "div.sp_article_modern_card h3.sp_article_modern_title a"
     override fun latestUpdatesFromElement(element: Element): SAnime = SAnime.create().apply {
         url = element.attr("href").removePrefix(baseUrl)
         title = element.text().trim()
@@ -363,54 +358,35 @@ class GakuensaiFansub :
         val thumbnail = details.thumbnail_url
         if (!thumbnail.isNullOrBlank()) cacheThumbnail(anime.url, thumbnail)
 
-        if (statusCache.isEmpty()) {
-            rememberStatuses(runCatching { client.newCall(GET(projectsUrl, headers)).execute().asJsoup() }.getOrElse { document })
-        }
+        ensureStatuses(document)
         details.status = statusCache[anime.url] ?: SAnime.UNKNOWN
 
-        // Solo-torrent se sabe recién tras consultar el AJAX de episodios; se reutiliza
-        // torrentOnlyCache si getEpisodeList ya corrió antes en esta sesión. Si la consulta
-        // AJAX falla, NO se marca como torrent-only para evitar un falso positivo.
-        val isTorrentOnly = torrentOnlyCache[anime.url] ?: run {
-            val releaseIds = document.select("button.accordion-project-button[data-release-id]")
-                .mapNotNull { it.attr("data-release-id").ifBlank { null } }
-            if (releaseIds.isEmpty()) {
-                false
-            } else {
-                val cardsByRelease = releaseIds.map { it to fetchReleaseCards(it, "$baseUrl${anime.url}") }
-                val allQueriesFailed = cardsByRelease.all { (_, cards) -> cards.isEmpty() }
-                val hasMediafire = cardsByRelease.any { (_, cards) -> cards.any { it.mediafireHrefs.isNotEmpty() } }
-                if (allQueriesFailed) {
-                    false
-                } else {
-                    val result = !hasMediafire
-                    torrentOnlyCache[anime.url] = result
-                    result
-                }
-            }
-        }
-        if (isTorrentOnly) {
+        if (isTorrentOnly(document)) {
             details.description = TORRENT_ONLY_NOTICE + details.description.orEmpty()
         }
 
         return details
     }
 
-    override fun animeDetailsParse(document: Document): SAnime = SAnime.create().apply {
-        title = document.selectFirst("h1")?.text()?.trim().orEmpty()
-        thumbnail_url = document.selectFirst("div.hero-poster-wrapper img")?.attr("src")
-        description = document.select("div.sinopsis-inner").text().trim()
+    // Filas dt/dd de los paneles de la ficha (datos técnicos, staff).
+    private fun tableRows(document: Document, panelSelector: String): List<Pair<String, String>> = document.select("$panelSelector div.ficha-table-row").mapNotNull { row ->
+        val key = row.selectFirst("dt")?.text()?.trim().orEmpty()
+        val value = row.selectFirst("dd")?.text()?.trim().orEmpty()
+        if (key.isBlank() && value.isBlank()) null else key to value
+    }
 
-        val staff = document.select("div.gakuensai-info-card--staff dt, div.gakuensai-info-card--staff dd")
-            .chunked(2)
-            .joinToString("\n") { pair -> "${pair.getOrNull(0)?.text().orEmpty()}: ${pair.getOrNull(1)?.text().orEmpty()}" }
+    override fun animeDetailsParse(document: Document): SAnime = SAnime.create().apply {
+        title = document.selectFirst("h1.ficha-hero-title")?.text()?.trim().orEmpty()
+        thumbnail_url = document.selectFirst("div.ficha-hero-poster-frame img")?.attr("src")
+        description = document.selectFirst("div.ficha-hero-synopsis")?.text()?.trim().orEmpty()
+
+        val staff = tableRows(document, "section.ficha-staff")
+            .joinToString("\n") { (key, value) -> "$key: $value" }
         if (staff.isNotBlank()) {
             description = (description.orEmpty() + "\n\n" + staff).trim()
         }
 
-        val technical = document.select("div.gakuensai-info-card--technical dt, div.gakuensai-info-card--technical dd")
-            .chunked(2)
-            .associate { pair -> pair.getOrNull(0)?.text()?.trim().orEmpty() to pair.getOrNull(1)?.text()?.trim().orEmpty() }
+        val technical = tableRows(document, "section.ficha-tech").toMap()
         genre = technical["Fuente"]
 
         // El estado real se completa en getAnimeDetails, que sí tiene la url del anime.
@@ -421,10 +397,13 @@ class GakuensaiFansub :
     private val statusCache = mutableMapOf<String, Int>()
 
     private fun rememberStatuses(document: Document) {
-        val sections = document.select("div.entry > div")
-        listOf(SECTION_ONGOING to SAnime.ONGOING, SECTION_COMPLETED to SAnime.COMPLETED).forEach { (sectionName, status) ->
-            val header = sections.firstOrNull { it.selectFirst("h2")?.text()?.trim()?.startsWith(sectionName) == true }
-            val container = header?.nextElementSibling() ?: return@forEach
+        document.select("div.fichas-tab-panel h3.fichas-section").forEach { header ->
+            val status = when (normalizeSection(header.text())) {
+                SECTION_ONGOING -> SAnime.ONGOING
+                SECTION_COMPLETED -> SAnime.COMPLETED
+                else -> return@forEach
+            }
+            val container = header.nextElementSibling() ?: return@forEach
             container.select(seriesCardSelector()).forEach { element ->
                 val href = element.selectFirst("a[href]")?.attr("href")?.removePrefix(baseUrl)
                 if (!href.isNullOrBlank()) statusCache[href] = status
@@ -432,10 +411,16 @@ class GakuensaiFansub :
         }
     }
 
+    private fun ensureStatuses(fallback: Document) {
+        if (statusCache.isNotEmpty()) return
+        rememberStatuses(runCatching { client.newCall(GET(projectsUrl, headers)).execute().asJsoup() }.getOrElse { fallback })
+    }
+
     override fun animeDetailsRequest(anime: SAnime): Request = GET("$baseUrl${anime.url}", headers)
 
     // ============================== Episode list ==============================
-    // Los episodios llegan por AJAX (JSON con HTML embebido), no en el HTML de la página.
+    // Los episodios ya vienen en el HTML de la ficha (sección "Descargas"). Cada botón apunta
+    // a un enlace del propio sitio (sa=enlaces) que redirige al host real (MediaFire/torrent).
     // Se sobreescribe getEpisodeList entero; el resto de hooks quedan inutilizados.
     override fun episodeListRequest(anime: SAnime): Request = throw UnsupportedOperationException()
     override fun episodeListParse(response: Response): List<SEpisode> = throw UnsupportedOperationException()
@@ -447,114 +432,71 @@ class GakuensaiFansub :
         return ext in VIDEO_EXTENSIONS
     }
 
-    // "Release card" = 1 tarjeta del acordeón AJAX; puede ser 1 episodio suelto o un batch
-    // con uno o más enlaces mediafire (carpetas o archivos).
-    private data class ReleaseCard(val label: String, val mediafireHrefs: List<String>)
+    private fun downloadEpisodes(document: Document): List<Element> = document.select("section.ficha-downloads article.ficha-download-episode")
 
-    // Caché de sesión por release_id, así getAnimeDetails y getEpisodeList no repiten la
-    // misma petición AJAX.
-    private val releaseCardsCache = mutableMapOf<String, List<ReleaseCard>>()
+    private fun mediafireEnlaces(document: Document): List<String> = downloadEpisodes(document)
+        .flatMap { episode -> episode.select("a.btn-mediafire[href]").map { it.attr("href") } }
 
-    private fun fetchReleaseCards(releaseId: String, refererUrl: String): List<ReleaseCard> {
-        releaseCardsCache[releaseId]?.let { return it }
+    // Hay bloques de descarga pero ninguno con MediaFire (solo torrent).
+    private fun isTorrentOnly(document: Document): Boolean = downloadEpisodes(document).isNotEmpty() && mediafireEnlaces(document).isEmpty()
 
-        val body = FormBody.Builder()
-            .add("action", "gakuensai_load_release_downloads")
-            .add("release_id", releaseId)
-            .build()
-        // El sitio devuelve HTTP 403 si la petición no trae Referer ni X-Requested-With,
-        // como las manda un navegador real. OkHttp no los añade por su cuenta.
-        val ajaxHeaders = headers.newBuilder()
-            .set("Referer", refererUrl)
-            .set("X-Requested-With", "XMLHttpRequest")
-            .set("Origin", baseUrl)
-            .build()
-        val request = Request.Builder().url(ajaxUrl).post(body).headers(ajaxHeaders).build()
+    // Caché de sesión: enlace del sitio -> URL real de MediaFire.
+    private val downloadLinkCache = mutableMapOf<String, String>()
 
-        val response = try {
-            client.newCall(request).execute()
+    private fun resolveDownloadLink(enlaceUrl: String): String? {
+        downloadLinkCache[enlaceUrl]?.let { return it }
+
+        val resolved = try {
+            noRedirectClient.newCall(GET(enlaceUrl, headers)).execute().use { response ->
+                val location = response.header("Location")
+                when {
+                    !location.isNullOrBlank() -> response.request.url.resolve(location)?.toString()
+                    response.isSuccessful -> MEDIAFIRE_URL_REGEX.find(
+                        response.body.string().replace("&amp;", "&").replace("\\/", "/"),
+                    )?.value
+                    else -> {
+                        Log.e(name, "Enlace $enlaceUrl devolvió HTTP ${response.code}")
+                        null
+                    }
+                }
+            }
         } catch (e: Exception) {
-            Log.e(name, "Fallo de red al pedir release_id=$releaseId", e)
-            return emptyList()
+            Log.e(name, "Fallo al resolver el enlace $enlaceUrl", e)
+            null
         }
 
-        if (!response.isSuccessful) {
-            Log.e(name, "AJAX release_id=$releaseId devolvió HTTP ${response.code}")
-            response.close()
-            return emptyList()
+        if (resolved != null && "mediafire.com" in resolved) {
+            downloadLinkCache[enlaceUrl] = resolved
+            return resolved
         }
-
-        val bodyString = response.body.string()
-        val json = try {
-            JSONObject(bodyString)
-        } catch (e: Exception) {
-            Log.e(name, "Respuesta AJAX release_id=$releaseId no es JSON válido: ${bodyString.take(300)}", e)
-            return emptyList()
-        }
-
-        if (!json.optBoolean("success", false)) {
-            Log.e(name, "AJAX release_id=$releaseId respondió success=false: $bodyString")
-            return emptyList()
-        }
-
-        val html = json.optJSONObject("data")?.optString("html").orEmpty()
-        if (html.isBlank()) {
-            Log.e(name, "AJAX release_id=$releaseId respondió sin html en data")
-            return emptyList()
-        }
-
-        val cards = Jsoup.parse(html).select("div.gakuensai-release-card").map { card ->
-            val label = card.selectFirst("h5")?.text()?.trim().orEmpty()
-            val mediafireHrefs = card.select("a[href*=mediafire.com]").map { it.attr("href") }
-            ReleaseCard(label, mediafireHrefs)
-        }
-        releaseCardsCache[releaseId] = cards
-        return cards
+        Log.e(name, "El enlace $enlaceUrl no llevó a MediaFire: $resolved")
+        return null
     }
 
-    // Marca si la última consulta de un anime resultó ser solo-torrent (sin ningún link de
-    // MediaFire), para que getAnimeDetails anteponga el aviso a la descripción.
-    private val torrentOnlyCache = mutableMapOf<String, Boolean>()
+    private data class LooseFile(val quickkey: String, val filename: String)
 
     override suspend fun getEpisodeList(anime: SAnime): List<SEpisode> {
         val document = client.newCall(GET("$baseUrl${anime.url}", headers)).execute().asJsoup()
-        if (statusCache.isEmpty()) {
-            rememberStatuses(
-                runCatching { client.newCall(GET(projectsUrl, headers)).execute().asJsoup() }.getOrElse { document },
-            )
-        }
+        ensureStatuses(document)
 
-        val releaseIds = document.select("button.accordion-project-button[data-release-id]")
-            .mapNotNull { it.attr("data-release-id").ifBlank { null } }
-        if (releaseIds.isEmpty()) {
-            torrentOnlyCache[anime.url] = false
-            return emptyList()
-        }
+        val enlaces = mediafireEnlaces(document)
+        if (enlaces.isEmpty()) return emptyList()
 
-        val cardsByRelease = releaseIds.map { it to fetchReleaseCards(it, "$baseUrl${anime.url}") }
-        val allQueriesFailed = cardsByRelease.all { (_, cards) -> cards.isEmpty() }
-        val allCards = cardsByRelease.flatMap { (_, cards) -> cards }
-        val allMediafireHrefs = allCards.flatMap { it.mediafireHrefs }
+        val mediafireLinks = coroutineScope {
+            enlaces.map { enlace -> async(Dispatchers.IO) { resolveDownloadLink(enlace) } }.awaitAll()
+        }.filterNotNull().distinct()
 
-        if (allQueriesFailed) {
-            // Fallo de red/servidor (ver Logcat). No se cachea nada ni se marca torrent-only
-            // para poder reintentar en la próxima consulta.
-            return emptyList()
-        }
+        // Si ningún enlace se pudo resolver (fallo de red/servidor, ver Logcat) no se devuelve
+        // nada y se puede reintentar en la próxima consulta.
+        if (mediafireLinks.isEmpty()) return emptyList()
 
-        if (allMediafireHrefs.isEmpty()) {
-            torrentOnlyCache[anime.url] = true
-            return emptyList()
-        }
-        torrentOnlyCache[anime.url] = false
-
-        val hasFolder = allMediafireHrefs.any { it.contains("/folder/") }
+        val hasFolder = mediafireLinks.any { it.contains("/folder/") }
 
         if (hasFolder) {
             // Prioridad carpetas: se ignoran los archivos sueltos y se expanden todas las
             // carpetas, uniendo su contenido de video (una serie puede repartir sus
             // episodios en varias carpetas).
-            val videoFiles = allMediafireHrefs.filter { it.contains("/folder/") }
+            val videoFiles = mediafireLinks.filter { it.contains("/folder/") }
                 .mapNotNull { (extractor.parseLink(it) as? MediaFireLink.Folder)?.key }
                 .flatMap { key -> runCatching { extractor.listFiles(key) }.getOrElse { emptyList() } }
                 .filter { isVideoFile(it.filename) }
@@ -570,14 +512,15 @@ class GakuensaiFansub :
                 }
         }
 
-        // Sin carpetas: cada card es 1 episodio suelto con su propio link /file/.
-        data class LooseFile(val quickkey: String, val filename: String)
-
-        val looseFiles = allCards.mapNotNull { card ->
-            val fileHref = card.mediafireHrefs.firstOrNull { it.contains("/file/") } ?: return@mapNotNull null
-            val link = extractor.parseLink(fileHref) as? MediaFireLink.File ?: return@mapNotNull null
-            val filename = link.filename ?: extractor.resolveFileName(link.quickkey, hint = null)
-            LooseFile(link.quickkey, filename)
+        // Sin carpetas: cada botón es 1 episodio suelto con su propio link /file/.
+        val looseFiles = coroutineScope {
+            mediafireLinks.filter { it.contains("/file/") }.map { href ->
+                async(Dispatchers.IO) {
+                    val link = extractor.parseLink(href) as? MediaFireLink.File ?: return@async null
+                    val filename = link.filename ?: extractor.resolveFileName(link.quickkey, hint = null)
+                    LooseFile(link.quickkey, filename)
+                }
+            }.awaitAll().filterNotNull()
         }
 
         return FilenameUtils.sortBySeasonAndEpisodeDescending(looseFiles, { it.filename }, showFilename)
@@ -656,6 +599,9 @@ class GakuensaiFansub :
 
     companion object {
         private const val PAGE_SIZE = 24
+        private const val HOME_ARTICLES_PER_PAGE = 8
+        private const val LATEST_HOME_PAGES = 4
+        private val MEDIAFIRE_URL_REGEX = Regex("""https?://(?:www\.)?mediafire\.com/[^\s"'<>\\]+""")
         private const val NSFW_MARK = "\u0000NSFW\u0000"
         const val SECTION_ONGOING = "Activos"
         const val SECTION_COMPLETED = "Finalizados"
