@@ -1,8 +1,9 @@
 ext {
     extName = 'Gakuensai Fansub'
     extClass = '.GakuensaiFansub'
-    extVersionCode = 6
+    extVersionCode = 7
     isNsfw = true
+    libVersion = 16
 }
 
 apply plugin: "kei.plugins.extension.legacy"

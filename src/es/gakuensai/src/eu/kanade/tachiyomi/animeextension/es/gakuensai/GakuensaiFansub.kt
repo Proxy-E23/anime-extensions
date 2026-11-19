@@ -10,28 +10,36 @@ import aniyomi.lib.mediafireextractor.MediaFireLink
 import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.AnimesPage
+import eu.kanade.tachiyomi.animesource.model.Hoster
 import eu.kanade.tachiyomi.animesource.model.SAnime
 import eu.kanade.tachiyomi.animesource.model.SEpisode
 import eu.kanade.tachiyomi.animesource.model.Video
+import eu.kanade.tachiyomi.animesource.online.AnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.util.asJsoup
-import keiyoushi.utils.ParsedAnimeHttpLegacySource
+import keiyoushi.network.get
 import keiyoushi.utils.addListPreference
 import keiyoushi.utils.addSwitchPreference
 import keiyoushi.utils.getPreferencesLazy
+import keiyoushi.utils.tryParse
+import keiyoushi.utils.useAsJsoup
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.withContext
 import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
+import java.text.SimpleDateFormat
+import java.util.Locale
+import java.util.TimeZone
 
 class GakuensaiFansub :
-    ParsedAnimeHttpLegacySource(),
+    AnimeHttpSource(),
     ConfigurableAnimeSource {
 
     override val name = "Gakuensai Fansub"
@@ -109,8 +117,8 @@ class GakuensaiFansub :
         val resolved = pending.map { anime ->
             async(Dispatchers.IO) {
                 anime.url to try {
-                    val document = client.newCall(GET("$baseUrl${anime.url}", headers)).execute().asJsoup()
-                    animeDetailsParse(document).thumbnail_url
+                    val document = client.get("$baseUrl${anime.url}", headers).useAsJsoup()
+                    parseAnimeDetails(document).thumbnail_url
                 } catch (_: Exception) {
                     null
                 }
@@ -163,7 +171,7 @@ class GakuensaiFansub :
     // Catálogo crudo completo (SFW + NSFW, sin filtrar todavía). Una sola petición: ambas
     // pestañas vienen en el mismo HTML. Si falla se propaga el error (no se cachea vacío).
     private suspend fun getFullCatalog(): List<SAnime> = popularCache ?: run {
-        val document = client.newCall(popularAnimeRequest(1)).execute().asJsoup()
+        val document = client.get(projectsUrl, headers).useAsJsoup()
         parseProjectsListing(document).also { if (it.isNotEmpty()) popularCache = it }
     }
 
@@ -223,13 +231,6 @@ class GakuensaiFansub :
 
     private fun sectionMark(section: String) = "\u0001$section\u0001"
 
-    override fun popularAnimeSelector(): String = seriesCardSelector()
-
-    // Nunca se invoca en la práctica; getPopularAnime maneja el flujo real.
-    override fun popularAnimeFromElement(element: Element): SAnime = seriesCardToSAnime(element, isNsfwSection = false, section = SECTION_ONGOING)
-
-    override fun popularAnimeNextPageSelector(): String? = null
-
     // Requerido por la clase base; getPopularAnime maneja la paginación real.
     override fun popularAnimeParse(response: Response): AnimesPage = AnimesPage(parseProjectsListing(response.asJsoup()), false)
 
@@ -270,7 +271,7 @@ class GakuensaiFansub :
 
         val posts = (1..LATEST_HOME_PAGES).map { homePage ->
             async(Dispatchers.IO) {
-                runCatching { parseHomePosts(client.newCall(GET(homePageUrl(homePage), headers)).execute().asJsoup()) }
+                runCatching { parseHomePosts(client.get(homePageUrl(homePage), headers).useAsJsoup()) }
                     .getOrElse { emptyList() }
             }
         }.awaitAll().flatten()
@@ -305,22 +306,12 @@ class GakuensaiFansub :
             ?.value
     }
 
-    override fun latestUpdatesSelector(): String = "div.sp_article_modern_card h3.sp_article_modern_title a"
-    override fun latestUpdatesFromElement(element: Element): SAnime = SAnime.create().apply {
-        url = element.attr("href").removePrefix(baseUrl)
-        title = element.text().trim()
-    }
-    override fun latestUpdatesNextPageSelector(): String? = null
-
     // Requerido por la clase base; getLatestUpdates maneja la consolidación real.
     override fun latestUpdatesParse(response: Response): AnimesPage = AnimesPage(emptyList(), false)
 
     // =============================== Search ==================================
     // No hay buscador dedicado; se filtra en memoria sobre el catálogo completo.
     override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request = popularAnimeRequest(page)
-    override fun searchAnimeSelector(): String = popularAnimeSelector()
-    override fun searchAnimeFromElement(element: Element): SAnime = popularAnimeFromElement(element)
-    override fun searchAnimeNextPageSelector(): String? = null
 
     private val searchPageCache = mutableMapOf<String, AnimesPage>()
 
@@ -352,8 +343,8 @@ class GakuensaiFansub :
     // del anime para cachear la portada, resolver el estado por sesión, y anteponer el
     // aviso de "solo torrent" a la descripción cuando corresponda.
     override suspend fun getAnimeDetails(anime: SAnime): SAnime {
-        val document = client.newCall(animeDetailsRequest(anime)).execute().asJsoup()
-        val details = animeDetailsParse(document)
+        val document = client.get("$baseUrl${anime.url}", headers).useAsJsoup()
+        val details = parseAnimeDetails(document)
 
         val thumbnail = details.thumbnail_url
         if (!thumbnail.isNullOrBlank()) cacheThumbnail(anime.url, thumbnail)
@@ -375,7 +366,9 @@ class GakuensaiFansub :
         if (key.isBlank() && value.isBlank()) null else key to value
     }
 
-    override fun animeDetailsParse(document: Document): SAnime = SAnime.create().apply {
+    override fun animeDetailsParse(response: Response): SAnime = parseAnimeDetails(response.asJsoup())
+
+    private fun parseAnimeDetails(document: Document): SAnime = SAnime.create().apply {
         title = document.selectFirst("h1.ficha-hero-title")?.text()?.trim().orEmpty()
         thumbnail_url = document.selectFirst("div.ficha-hero-poster-frame img")?.attr("src")
         description = document.selectFirst("div.ficha-hero-synopsis")?.text()?.trim().orEmpty()
@@ -411,9 +404,9 @@ class GakuensaiFansub :
         }
     }
 
-    private fun ensureStatuses(fallback: Document) {
+    private suspend fun ensureStatuses(fallback: Document) {
         if (statusCache.isNotEmpty()) return
-        rememberStatuses(runCatching { client.newCall(GET(projectsUrl, headers)).execute().asJsoup() }.getOrElse { fallback })
+        rememberStatuses(runCatching { client.get(projectsUrl, headers).useAsJsoup() }.getOrElse { fallback })
     }
 
     override fun animeDetailsRequest(anime: SAnime): Request = GET("$baseUrl${anime.url}", headers)
@@ -424,8 +417,7 @@ class GakuensaiFansub :
     // Se sobreescribe getEpisodeList entero; el resto de hooks quedan inutilizados.
     override fun episodeListRequest(anime: SAnime): Request = throw UnsupportedOperationException()
     override fun episodeListParse(response: Response): List<SEpisode> = throw UnsupportedOperationException()
-    override fun episodeListSelector(): String = throw UnsupportedOperationException()
-    override fun episodeFromElement(element: Element): SEpisode = throw UnsupportedOperationException()
+    override fun seasonListParse(response: Response): List<SAnime> = throw UnsupportedOperationException()
 
     private fun isVideoFile(filename: String): Boolean {
         val ext = filename.substringAfterLast('.', "").lowercase()
@@ -443,6 +435,7 @@ class GakuensaiFansub :
     // Caché de sesión: enlace del sitio -> URL real de MediaFire.
     private val downloadLinkCache = mutableMapOf<String, String>()
 
+    // Se usa execute() a propósito: los helpers de keiyoushi.network lanzan error ante un 302.
     private fun resolveDownloadLink(enlaceUrl: String): String? {
         downloadLinkCache[enlaceUrl]?.let { return it }
 
@@ -475,8 +468,14 @@ class GakuensaiFansub :
 
     private data class LooseFile(val quickkey: String, val filename: String)
 
+    // MediaFire entrega la fecha de creación como "yyyy-MM-dd HH:mm:ss" en UTC. Solo viene al
+    // listar carpetas; los archivos sueltos no la traen y quedan sin fecha (0).
+    private val createdDateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).apply {
+        timeZone = TimeZone.getTimeZone("UTC")
+    }
+
     override suspend fun getEpisodeList(anime: SAnime): List<SEpisode> {
-        val document = client.newCall(GET("$baseUrl${anime.url}", headers)).execute().asJsoup()
+        val document = client.get("$baseUrl${anime.url}", headers).useAsJsoup()
         ensureStatuses(document)
 
         val enlaces = mediafireEnlaces(document)
@@ -507,7 +506,7 @@ class GakuensaiFansub :
                         url = "file::${seasoned.item.quickkey}::${seasoned.item.filename}"
                         name = seasoned.display.name
                         episode_number = seasoned.display.episodeNumber
-                        date_upload = 0L
+                        date_upload = createdDateFormat.tryParse(seasoned.item.created)
                     }
                 }
         }
@@ -534,17 +533,36 @@ class GakuensaiFansub :
             }
     }
 
-    // ============================== Video list ==============================
-    override fun videoListSelector(): String = throw UnsupportedOperationException()
-    override fun videoFromElement(element: Element): Video = throw UnsupportedOperationException()
-    override fun videoUrlParse(response: okhttp3.Response): String = throw UnsupportedOperationException()
+    // ============================== Hosters / Video list ==============================
+    // Cada episodio es un archivo de MediaFire, así que hay un único hoster. La URL directa
+    // caduca, por eso se resuelve recién al abrir el hoster y no al listar los episodios.
+    override fun hosterListParse(response: Response): List<Hoster> = throw UnsupportedOperationException()
 
-    override suspend fun getVideoList(episode: SEpisode): List<Video> {
+    override suspend fun getHosterList(episode: SEpisode): List<Hoster> {
         val parts = episode.url.split("::")
         if (parts.size < 3) return emptyList()
-        val quickkey = parts[1]
-        val filename = parts[2]
-        return extractor.videoFromFile(quickkey, filename)
+        return listOf(
+            Hoster(
+                hosterUrl = parts[1],
+                hosterName = "MediaFire",
+                internalData = parts[2],
+            ),
+        )
+    }
+
+    override suspend fun getVideoList(hoster: Hoster): List<Video> {
+        val quickkey = hoster.hosterUrl
+        val filename = hoster.internalData
+        if (quickkey.isBlank() || filename.isBlank()) return emptyList()
+
+        val directUrl = withContext(Dispatchers.IO) { extractor.resolveDirectVideoUrl(quickkey, filename) }
+        return listOf(
+            Video(
+                videoUrl = directUrl,
+                videoTitle = filename.substringBeforeLast('.'),
+                headers = headers.newBuilder().set("Referer", "https://www.mediafire.com/").build(),
+            ),
+        )
     }
 
     // ============================== Filtros ==============================
